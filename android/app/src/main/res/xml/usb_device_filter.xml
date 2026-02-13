@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Arduino LLC Leonardo -->
+    <usb-device vendor-id="0x2341" product-id="0x8036" />
+    <!-- Arduino SRL Leonardo -->
+    <usb-device vendor-id="0x2A03" product-id="0x8036" />
+    <!-- CDC-ACM class (opsiyonel geniş eşleşme) -->
+    <usb-device class="2" />
+</resources>

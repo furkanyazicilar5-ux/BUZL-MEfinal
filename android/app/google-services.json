@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "826512435949",
+    "project_id": "buzi-kiosk",
+    "storage_bucket": "buzi-kiosk.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:826512435949:android:ed398fb7c961584c06bae4",
+        "android_client_info": {
+          "package_name": "com.example.buzi_kiosk"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBQj4-_EZm-rPKV9TNhrmvpl4UUR3Doa4I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:826512435949:android:4b6d7ab90b145c2906bae4",
+        "android_client_info": {
+          "package_name": "com.example.buzi_kiosk_tmp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBQj4-_EZm-rPKV9TNhrmvpl4UUR3Doa4I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
