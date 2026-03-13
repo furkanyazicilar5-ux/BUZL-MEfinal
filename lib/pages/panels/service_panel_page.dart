@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../core/app_info.dart';
-
-// Local panel pages
 import 'logs_page.dart';
-
+import '../../home_page.dart';
 import '../../widgets/service_widgets/liquid_control_card.dart';
 import '../../widgets/service_widgets/machine_service.dart';
 import '../../widgets/service_widgets/stock_control_card.dart';
@@ -49,7 +47,6 @@ class _ServicePanelPageState extends State<ServicePanelPage> {
           final inventory = data['inventory'] ?? {};
           final levels = data['levels'] ?? {};
           final status = data['status'] ?? {};
-
           final isActive = status['isActive'] ?? false;
 
           return SingleChildScrollView(
@@ -77,25 +74,22 @@ class _ServicePanelPageState extends State<ServicePanelPage> {
                   maxVal: 80000,
                   onChange: (newValue, duration) async {
                     final now = DateTime.now();
-
-                    // Eğer süre 0 seçildiyse isActive false olmalı
                     if (duration == 0) {
                       await _service.machineRef.update({
                         'levels.liquid': newValue,
                         'levels.liquidBand':
-                            _service.bandForLiquid(newValue, 80000),
+                        _service.bandForLiquid(newValue, 80000),
                         'processing.isActive': false,
                         'processing.until': null,
                       });
                       return;
                     }
-
                     final until = Timestamp.fromDate(
                         now.add(Duration(minutes: duration)));
                     await _service.machineRef.update({
                       'levels.liquid': newValue,
                       'levels.liquidBand':
-                          _service.bandForLiquid(newValue, 80000),
+                      _service.bandForLiquid(newValue, 80000),
                       'processing.isActive': true,
                       'processing.until': until,
                     });
@@ -108,32 +102,73 @@ class _ServicePanelPageState extends State<ServicePanelPage> {
                   label: Text(isActive ? 'Satışı Kapat' : 'Satışı Aç'),
                 ),
                 const SizedBox(height: 16),
+
+                // ─── BAKIM TAMAMLANDI ───────────────────────────────────────
+                // SalesClosedPage(autoReturnHome:false) durumundan çıkışın
+                // TEK yolu bu butondur. Bakım kaydı yazar, satışı açar,
+                // tüm route stack'i temizleyerek HomePage'e gider.
                 ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.teal,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 32, vertical: 14),
+                  ),
                   onPressed: () async {
-                    final confirm = await showExitConfirmation(context);
-                    if (confirm == true) {
-                      await _service.finishMaintenance(context);
-                      if (context.mounted) Navigator.pop(context);
+                    final confirm = await showDialog<bool>(
+                      context: context,
+                      builder: (_) => AlertDialog(
+                        title: const Text('Bakım Tamamlandı'),
+                        content: const Text(
+                            'Bakım kaydı eklenecek ve satış yeniden açılacak. Onaylıyor musunuz?'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('İptal'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Onayla'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirm != true) return;
+
+                    // 1. Bakım kaydı ekle
+                    await _service.finishMaintenance(context);
+                    // 2. Satışı aç (isActive → true)
+                    await _service.machineRef
+                        .update({'status.isActive': true});
+                    // 3. Tüm stack'i temizle, HomePage'e git
+                    if (context.mounted) {
+                      Navigator.pushAndRemoveUntil(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const HomePage()),
+                            (route) => false,
+                      );
                     }
                   },
                   icon: const Icon(Icons.build_circle_outlined),
                   label: const Text('Bakım Tamamlandı'),
                 ),
+                // ───────────────────────────────────────────────────────────
 
-const SizedBox(height: 16),
-Card(
-  child: ListTile(
-    leading: const Icon(Icons.receipt_long),
-    title: const Text('Loglar / USB Protokol'),
-    subtitle: const Text('Saha teşhisi için kopyala / temizle'),
-    onTap: () {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => LogsPage()),
-      );
-    },
-  ),
-),
+                const SizedBox(height: 16),
+                Card(
+                  child: ListTile(
+                    leading: const Icon(Icons.receipt_long),
+                    title: const Text('Loglar / USB Protokol'),
+                    subtitle: const Text('Saha teşhisi için kopyala / temizle'),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => LogsPage()),
+                      );
+                    },
+                  ),
+                ),
               ],
             ),
           );

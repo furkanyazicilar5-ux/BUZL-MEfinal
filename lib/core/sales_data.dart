@@ -3,23 +3,39 @@ import 'package:intl/intl.dart';
 import 'error_codes.dart';
 import 'app_info.dart';
 
-/// A patched version of [SalesData] that adds support for minor‑unit price
-/// recording, as required by the BuzLime design guide. In addition to the
-/// existing inventory and profit logging methods, this version exposes a
-/// `recordSale` function that writes a concise sales document containing the
-/// `drink`, `size_ml`, `price_kurus` and a server timestamp. This decouples
-/// analytics from UI strings and eliminates fragile string parsing. Existing
-/// methods (`sellSmall`, `sellLarge`, `sellDrink`, `logRefund`) remain
-/// unmodified for backwards compatibility.
+/// SalesData — satış, iade ve stok yönetimi
+///
+/// Firestore yapısı (ilgili alanlar):
+///   inventory.smallCups  : int   — küçük bardak adedi
+///   inventory.largeCups  : int   — büyük bardak adedi
+///   levels.lemon         : int   — limon içecek seviyesi (mL)
+///   levels.orange        : int   — portakal içecek seviyesi (mL)
+///   levels.liquid        : int   — LEGACY toplam seviye (geriye uyumluluk)
+///
+/// Her satışta:
+///   - Küçük bardak: 1 küçük bardak + 300 mL içecek düşür (ilgili türden)
+///   - Büyük bardak: 1 büyük bardak + 400 mL içecek düşür (ilgili türden)
+///
+/// İçecek tam dolu: 19 000 mL (hem Limon hem Portakal)
 class SalesData {
   static final SalesData instance = SalesData._internal();
   SalesData._internal();
+
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final String machineId = kMachineId;
   String? lastSaleCupType;
 
+  // ─── Küçük bardak porsiyon hacmi (mL) ──────────────────────────────────
+  static const int kSmallMl = 300;
+  // ─── Büyük bardak porsiyon hacmi (mL) ──────────────────────────────────
+  static const int kLargeMl = 400;
+
   Future<void> _ensureDailyLog(String day) async {
-    final logRef = _db.collection('machines').doc(machineId).collection('profit_logs').doc(day);
+    final logRef = _db
+        .collection('machines')
+        .doc(machineId)
+        .collection('profit_logs')
+        .doc(day);
 
     await logRef.set({
       'timestamp': FieldValue.serverTimestamp(),
@@ -37,56 +53,43 @@ class SalesData {
     }, SetOptions(merge: true));
   }
 
-  /// Küçük bardak satışı
+  /// Küçük bardak satışı (eski API, geriye uyumluluk)
   Future<void> sellSmall({required double priceTl}) async {
-    lastSaleCupType = 'small';
-    final now = DateTime.now().toLocal();
-    final day = DateFormat('yyyy-MM-dd').format(now);
-    final machineRef = _db.collection('machines').doc(machineId);
-    final logRef = machineRef.collection('profit_logs').doc(day);
-
-    await _ensureDailyLog(day);
-
-    await _db.runTransaction((tx) async {
-      final mSnap = await tx.get(machineRef);
-      final m = (mSnap.data() ?? {});
-      final inv = Map<String, dynamic>.from(m['inventory'] ?? {});
-      final lv = Map<String, dynamic>.from(m['levels'] ?? {});
-      final dp = Map<String, dynamic>.from(m['daily_profit'] ?? {'current_day': day, 'profit_today': 0.0});
-      final sales = Map<String, dynamic>.from(m['sales'] ?? {'smallSold': 0, 'largeSold': 0, 'smallTl': 0.0, 'largeTl': 0.0});
-
-      final cups = (inv['smallCups'] ?? 0) as int;
-      final liquid = (lv['liquid'] ?? 0) as int;
-      if (cups <= 0 || liquid < 300) throw StateError('Yetersiz stok.');
-
-      inv['smallCups'] = cups - 1;
-      lv['liquid'] = liquid - 300;
-      dp['current_day'] = day;
-      dp['profit_today'] = (dp['profit_today'] ?? 0.0) + priceTl;
-      sales['smallSold'] = (sales['smallSold'] ?? 0) + 1;
-      sales['smallTl'] = (sales['smallTl'] ?? 0.0) + priceTl;
-
-      tx.update(machineRef, {
-        'inventory': inv,
-        'levels': lv,
-        'daily_profit': dp,
-        'profit_total': FieldValue.increment(priceTl),
-        'sales': sales,
-      });
-
-      final lSnap = await tx.get(logRef);
-      final l = (lSnap.data() ?? {});
-      final lSales = {
-        'smallSold': (l['smallSold'] ?? 0) + 1,
-        'smallTl': (l['smallTl'] ?? 0.0) + priceTl,
-      };
-      tx.set(logRef, lSales, SetOptions(merge: true));
-    });
+    await sellDrink(title: 'smallCup', volume: 'small', priceTl: priceTl);
   }
 
-  /// Büyük bardak satışı
+  /// Büyük bardak satışı (eski API, geriye uyumluluk)
   Future<void> sellLarge({required double priceTl}) async {
-    lastSaleCupType = 'large';
+    await sellDrink(title: 'largeCup', volume: 'large', priceTl: priceTl);
+  }
+
+  /// Ana satış metodu.
+  ///
+  /// [title]   → 'Limon' | 'Portakal' (içecek türü; 'smallCup'/'largeCup' legacy de kabul edilir)
+  /// [volume]  → 'small' | 'large' | '300 ml' | '400 ml' vb.  (bardak boyutu)
+  /// [drinkCode] → 'LEMON' | 'ORANGE'  (opsiyonel, title'dan çıkarılır)
+  ///
+  /// Firestore transaction içinde:
+  ///   1) Bardak sayısını 1 azalt (boyuta göre küçük/büyük)
+  ///   2) İlgili içecek seviyesini (levels.lemon veya levels.orange) ml kadar azalt
+  ///   3) Legacy levels.liquid alanını da güncelle (toplam)
+  ///   4) Satış ve kar kayıtlarını güncelle
+  Future<void> sellDrink({
+    required String title,
+    required String volume,
+    required double priceTl,
+    String? drinkCode, // 'LEMON' | 'ORANGE'
+  }) async {
+    // ─── Bardak boyutunu belirle ───────────────────────────────────────────
+    final isSmall = _isSmallCup(volume);
+    lastSaleCupType = isSmall ? 'small' : 'large';
+    final ml = isSmall ? kSmallMl : kLargeMl;
+
+    // ─── İçecek türünü belirle ─────────────────────────────────────────────
+    // drinkCode yoksa title'dan çıkar
+    final drink = drinkCode ?? _drinkCodeFromTitle(title);
+    final liquidKey = _liquidKeyForDrink(drink); // 'lemon' | 'orange'
+
     final now = DateTime.now().toLocal();
     final day = DateFormat('yyyy-MM-dd').format(now);
     final machineRef = _db.collection('machines').doc(machineId);
@@ -95,37 +98,69 @@ class SalesData {
     await _ensureDailyLog(day);
 
     await _db.runTransaction((tx) async {
+      // ── OKUMALAR ──────────────────────────────────────────────────────────
       final mSnap = await tx.get(machineRef);
-      final m = (mSnap.data() ?? {});
-      final inv = Map<String, dynamic>.from(m['inventory'] ?? {});
-      final lv = Map<String, dynamic>.from(m['levels'] ?? {});
-      final dp = Map<String, dynamic>.from(m['daily_profit'] ?? {'current_day': day, 'profit_today': 0.0});
-      final sales = Map<String, dynamic>.from(m['sales'] ?? {'smallSold': 0, 'largeSold': 0, 'smallTl': 0.0, 'largeTl': 0.0});
+      final lSnap = await tx.get(logRef);
 
-      final cups = (inv['largeCups'] ?? 0) as int;
-      final liquid = (lv['liquid'] ?? 0) as int;
-      if (cups <= 0 || liquid < 400) throw StateError('Yetersiz stok.');
+      final m     = mSnap.data() ?? {};
+      final inv   = Map<String, dynamic>.from(m['inventory']    ?? {});
+      final lv    = Map<String, dynamic>.from(m['levels']       ?? {});
+      final dp    = Map<String, dynamic>.from(m['daily_profit'] ??
+          {'current_day': day, 'profit_today': 0.0});
+      final sales = Map<String, dynamic>.from(m['sales']        ??
+          {'smallSold': 0, 'largeSold': 0, 'smallTl': 0.0, 'largeTl': 0.0});
+      final l     = lSnap.data() ?? {};
 
-      inv['largeCups'] = cups - 1;
-      lv['liquid'] = liquid - 400;
-      dp['current_day'] = day;
-      dp['profit_today'] = (dp['profit_today'] ?? 0.0) + priceTl;
-      sales['largeSold'] = (sales['largeSold'] ?? 0) + 1;
-      sales['largeTl'] = (sales['largeTl'] ?? 0.0) + priceTl;
+      // ── STOK KONTROL ──────────────────────────────────────────────────────
+      final cupField = isSmall ? 'smallCups' : 'largeCups';
+      final cups     = (inv[cupField] ?? 0) as int;
+      if (cups <= 0) throw StateError('Bardak stoku tükendi ($cupField).');
 
+      // İçecek seviyesi — önce ayrı alan, yoksa legacy liquid
+      final currentLiquid = (lv[liquidKey] ?? lv['liquid'] ?? 0) as int;
+      if (currentLiquid < ml) {
+        throw StateError('İçecek seviyesi yetersiz ($liquidKey: $currentLiquid mL < $ml mL).');
+      }
+
+      // ── HESAPLA ───────────────────────────────────────────────────────────
+      inv[cupField] = cups - 1;
+
+      // Ayrı içecek alanını düşür
+      lv[liquidKey] = currentLiquid - ml;
+
+      // Legacy levels.liquid'i güncelle (lemon + orange toplamı)
+      final otherKey    = liquidKey == 'lemon' ? 'orange' : 'lemon';
+      final otherLiquid = (lv[otherKey] ?? lv['liquid'] ?? 0) as int;
+      lv['liquid']      = (lv[liquidKey] as int) + otherLiquid;
+
+      dp['current_day']   = day;
+      dp['profit_today']  = (dp['profit_today'] ?? 0.0) + priceTl;
+
+      if (isSmall) {
+        sales['smallSold'] = (sales['smallSold'] ?? 0) + 1;
+        sales['smallTl']   = (sales['smallTl']   ?? 0.0) + priceTl;
+      } else {
+        sales['largeSold'] = (sales['largeSold'] ?? 0) + 1;
+        sales['largeTl']   = (sales['largeTl']   ?? 0.0) + priceTl;
+      }
+
+      // ── YAZMALAR ──────────────────────────────────────────────────────────
       tx.update(machineRef, {
-        'inventory': inv,
-        'levels': lv,
+        'inventory':    inv,
+        'levels':       lv,
         'daily_profit': dp,
         'profit_total': FieldValue.increment(priceTl),
-        'sales': sales,
+        'sales':        sales,
       });
 
-      final lSnap = await tx.get(logRef);
-      final l = (lSnap.data() ?? {});
-      final lSales = {
+      final lSales = isSmall
+          ? {
+        'smallSold': (l['smallSold'] ?? 0) + 1,
+        'smallTl':   (l['smallTl']   ?? 0.0) + priceTl,
+      }
+          : {
         'largeSold': (l['largeSold'] ?? 0) + 1,
-        'largeTl': (l['largeTl'] ?? 0.0) + priceTl,
+        'largeTl':   (l['largeTl']   ?? 0.0) + priceTl,
       };
       tx.set(logRef, lSales, SetOptions(merge: true));
     });
@@ -134,155 +169,86 @@ class SalesData {
   /// İade kaydı
   Future<void> logRefund({
     required double amountTl,
-    required int amountMl,
+    required int    amountMl,
     required String errorCode,
     required String cupType,
   }) async {
     if (!RefundErrorCodes.isValid(errorCode)) {
       throw ArgumentError('Geçersiz hata kodu: $errorCode');
     }
-    final finalCupType = cupType;
 
-    final tmpRef = await _db.collection('meta').add({'now': FieldValue.serverTimestamp()});
-    final snap = await tmpRef.get();
+    final tmpRef  = await _db.collection('meta').add({'now': FieldValue.serverTimestamp()});
+    final snap    = await tmpRef.get();
     await tmpRef.delete();
     final serverNow = (snap['now'] as Timestamp).toDate().toLocal();
-    final day = DateFormat('yyyy-MM-dd').format(serverNow);
+    final day       = DateFormat('yyyy-MM-dd').format(serverNow);
     final machineRef = _db.collection('machines').doc(machineId);
-    final logRef = machineRef.collection('profit_logs').doc(day);
+    final logRef     = machineRef.collection('profit_logs').doc(day);
 
     await _ensureDailyLog(day);
 
     await _db.runTransaction((tx) async {
       final logSnap = await tx.get(logRef);
-      final mSnap = await tx.get(machineRef);
+      final mSnap   = await tx.get(machineRef);
 
-      final ldata = (logSnap.data() ?? {});
-      final mdata = (mSnap.data() ?? {});
+      final ldata = logSnap.data() ?? {};
+      final mdata = mSnap.data()  ?? {};
 
       final lrefunds = Map<String, dynamic>.from(ldata['refunds'] ?? {});
       final ldetails = Map<String, dynamic>.from(lrefunds['details'] ?? {});
-      lrefunds['total'] = (lrefunds['total'] ?? 0) + 1;
+      lrefunds['total']    = (lrefunds['total']    ?? 0) + 1;
       lrefunds['amountTl'] = (lrefunds['amountTl'] ?? 0.0) + amountTl;
       lrefunds['amountMl'] = (lrefunds['amountMl'] ?? 0) + amountMl;
-      ldetails[errorCode] = (ldetails[errorCode] ?? 0) + 1;
-      lrefunds['details'] = ldetails;
+      ldetails[errorCode]  = (ldetails[errorCode]  ?? 0) + 1;
+      lrefunds['details']  = ldetails;
       tx.set(logRef, {'refunds': lrefunds}, SetOptions(merge: true));
 
       final mrefunds = Map<String, dynamic>.from(mdata['refunds'] ?? {});
-      final mdetails = Map<String, dynamic>.from((mrefunds['details'] ?? {'overfreeze': 0, 'cupDrop': 0, 'other': 0}));
-      mrefunds['total'] = (mrefunds['total'] ?? 0) + 1;
+      final mdetails = Map<String, dynamic>.from(
+        mrefunds['details'] ??
+            {'overfreeze': 0, 'cupDrop': 0, 'other': 0},
+      );
+      mrefunds['total']    = (mrefunds['total']    ?? 0) + 1;
       mrefunds['amountTl'] = (mrefunds['amountTl'] ?? 0.0) + amountTl;
       mrefunds['amountMl'] = (mrefunds['amountMl'] ?? 0) + amountMl;
-      mdetails[errorCode] = (mdetails[errorCode] ?? 0) + 1;
-      mrefunds['details'] = mdetails;
+      mdetails[errorCode]  = (mdetails[errorCode]  ?? 0) + 1;
+      mrefunds['details']  = mdetails;
       tx.set(machineRef, {'refunds': mrefunds}, SetOptions(merge: true));
     });
 
-    await machineRef.collection('profit_logs').doc('refund_logs').collection(day).add({
+    await machineRef
+        .collection('profit_logs')
+        .doc('refund_logs')
+        .collection(day)
+        .add({
       'timestamp': Timestamp.fromDate(serverNow),
-      'cupType': finalCupType,
+      'cupType':   cupType,
       'errorCode': errorCode,
-      'amountTl': amountTl,
-      'amountMl': amountMl,
+      'amountTl':  amountTl,
+      'amountMl':  amountMl,
     });
   }
 
-  Future<void> sellDrink({
-    required String title,
-    required String volume,
-    required double priceTl,
-  }) async {
-    final isSmall = title == 'smallCup';
-    lastSaleCupType = isSmall ? 'small' : 'large';
-    final now = DateTime.now().toLocal();
-    final day = DateFormat('yyyy-MM-dd').format(now);
-    final machineRef = _db.collection('machines').doc(machineId);
-    final logRef = machineRef.collection('profit_logs').doc(day);
+  // ─── YARDIMCI ──────────────────────────────────────────────────────────────
 
-    await _ensureDailyLog(day);
-
-    await _db.runTransaction((tx) async {
-      // 1️⃣ TÜM OKUMALAR EN BAŞTA
-      final mSnap = await tx.get(machineRef);
-      final lSnap = await tx.get(logRef);
-
-      final m = (mSnap.data() ?? {});
-      final inv = Map<String, dynamic>.from(m['inventory'] ?? {});
-      final lv = Map<String, dynamic>.from(m['levels'] ?? {});
-      final dp = Map<String, dynamic>.from(m['daily_profit'] ?? {'current_day': day, 'profit_today': 0.0});
-      final sales = Map<String, dynamic>.from(m['sales'] ?? {'smallSold': 0, 'largeSold': 0, 'smallTl': 0.0, 'largeTl': 0.0});
-      final l = (lSnap.data() ?? {});
-
-      // 2️⃣ İŞLEMLER
-      if (isSmall) {
-        final cups = (inv['smallCups'] ?? 0) as int;
-        final liquid = (lv['liquid'] ?? 0) as int;
-        if (cups <= 0 || liquid < 300) throw StateError('Yetersiz stok.');
-        inv['smallCups'] = cups - 1;
-        lv['liquid'] = liquid - 300;
-        dp['current_day'] = day;
-        dp['profit_today'] = (dp['profit_today'] ?? 0.0) + priceTl;
-        sales['smallSold'] = (sales['smallSold'] ?? 0) + 1;
-        sales['smallTl'] = (sales['smallTl'] ?? 0.0) + priceTl;
-      } else {
-        final cups = (inv['largeCups'] ?? 0) as int;
-        final liquid = (lv['liquid'] ?? 0) as int;
-        if (cups <= 0 || liquid < 400) throw StateError('Yetersiz stok.');
-        inv['largeCups'] = cups - 1;
-        lv['liquid'] = liquid - 400;
-        dp['current_day'] = day;
-        dp['profit_today'] = (dp['profit_today'] ?? 0.0) + priceTl;
-        sales['largeSold'] = (sales['largeSold'] ?? 0) + 1;
-        sales['largeTl'] = (sales['largeTl'] ?? 0.0) + priceTl;
-      }
-
-      // 3️⃣ TÜM YAZMALAR EN SON
-      tx.update(machineRef, {
-        'inventory': inv,
-        'levels': lv,
-        'daily_profit': dp,
-        'profit_total': FieldValue.increment(priceTl),
-        'sales': sales,
-      });
-
-      if (isSmall) {
-        final lSales = {
-          'smallSold': (l['smallSold'] ?? 0) + 1,
-          'smallTl': (l['smallTl'] ?? 0.0) + priceTl,
-        };
-        tx.set(logRef, lSales, SetOptions(merge: true));
-      } else {
-        final lSales = {
-          'largeSold': (l['largeSold'] ?? 0) + 1,
-          'largeTl': (l['largeTl'] ?? 0.0) + priceTl,
-        };
-        tx.set(logRef, lSales, SetOptions(merge: true));
-      }
-    });
+  /// volume / title'dan küçük bardak mı belirle
+  bool _isSmallCup(String s) {
+    final low = s.toLowerCase();
+    return low.contains('small') ||
+        low.contains('küçük') ||
+        low.contains('300');
   }
 
-  /// Record a concise sales document for analytics.
-  ///
-  /// The PDF mandates that sales be logged using fields that cannot be
-  /// misinterpreted by string parsing. This function writes a document into
-  /// the `sales` subcollection of the machine that contains only the drink
-  /// identifier, the pour size (in millilitres), the price in minor units
-  /// (kuruş), and a server timestamp. No inventory or profit updates are
-  /// performed here; callers should continue using the traditional
-  /// `sellSmall`, `sellLarge` or `sellDrink` functions for inventory
-  /// adjustments.
-  Future<void> recordSale({
-    required String drink,
-    required int sizeMl,
-    required int priceKurus,
-  }) async {
-    final machineRef = _db.collection('machines').doc(machineId);
-    await machineRef.collection('sales').add({
-      'drink': drink,
-      'size_ml': sizeMl,
-      'price_kurus': priceKurus,
-      'timestamp': FieldValue.serverTimestamp(),
-    });
+  /// title → drinkCode
+  String _drinkCodeFromTitle(String title) {
+    final t = title.toLowerCase();
+    if (t.contains('limon') || t.contains('lemon')) return 'LEMON';
+    if (t.contains('portakal') || t.contains('orange')) return 'ORANGE';
+    return 'LEMON'; // varsayılan
+  }
+
+  /// drinkCode → Firestore levels alanı
+  String _liquidKeyForDrink(String drinkCode) {
+    return drinkCode == 'ORANGE' ? 'orange' : 'lemon';
   }
 }

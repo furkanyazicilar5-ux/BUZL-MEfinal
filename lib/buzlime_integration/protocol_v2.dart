@@ -1,15 +1,7 @@
 import 'dart:convert';
 
-// =============================================================================
-// protocol_v2.dart — USB-CDC JSON protokol tipleri (newline-delimited)
-//
-// DEĞİŞİKLİKLER (rev 2.1):
-//   - ProtoEvent.fromJson: order_id null güvenliği eklendi.
-//     DEVICE_READY gibi order_id içermeyen event'ler artık crash yapmıyor,
-//     orderId = 0 olarak işleniyor.
-//   - tryDecodeLine → encodeLine ile aynı dosyada birleşik kaldı (değişmedi).
-// =============================================================================
-
+/// USB-CDC JSON protocol (newline-delimited)
+///
 /// Flutter tarafı minimum: sadece komut gönderir ve event dinler.
 /// MCU tarafı süreç + MDB ödeme + hata yönetimi.
 
@@ -73,13 +65,12 @@ class ProtoResponse {
 }
 
 class ProtoEvent {
-  /// ORDER_STATUS | ORDER_DONE | ORDER_ERROR | DEVICE_READY | ...
+  /// ORDER_STATUS | ORDER_DONE | ORDER_ERROR
   ///
   /// Bazı MCU sürümlerinde `event` yerine `cmd` veya `name` alanı gelebilir.
   final String event;
 
   /// order_id bazen `orderId` gibi farklı isimle gelebilir.
-  /// DEVICE_READY gibi sipariş içermeyen event'lerde 0 döner.
   final int orderId;
   final Map<String, dynamic> raw;
   final int v;
@@ -88,23 +79,10 @@ class ProtoEvent {
 
   factory ProtoEvent.fromJson(Map<String, dynamic> j) {
     final evName = (j['event'] ?? j['cmd'] ?? j['name'] ?? '').toString();
-
-    // FIX: order_id yoksa (DEVICE_READY gibi event'ler) crash yerine 0 döndür.
     final oidRaw = j.containsKey('order_id')
         ? j['order_id']
-        : (j.containsKey('orderId')
-        ? j['orderId']
-        : (j.containsKey('orderID') ? j['orderID'] : null));
-
-    final int oid;
-    if (oidRaw == null) {
-      oid = 0; // Sipariş içermeyen event (örn. DEVICE_READY)
-    } else if (oidRaw is num) {
-      oid = oidRaw.toInt();
-    } else {
-      oid = int.tryParse(oidRaw.toString()) ?? 0;
-    }
-
+        : (j.containsKey('orderId') ? j['orderId'] : j['orderID']);
+    final oid = (oidRaw is num) ? oidRaw.toInt() : int.parse(oidRaw.toString());
     return ProtoEvent(
       event: evName,
       orderId: oid,

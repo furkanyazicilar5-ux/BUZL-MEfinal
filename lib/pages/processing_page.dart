@@ -1,3 +1,6 @@
+// processing_page.dart — Revize Edildi
+// 90 dakika kronometresi (admin panel içecek doldurma sonrası)
+// Navigasyon: süre bitince veya processing.isActive=false → HomePage
 import 'package:buzi_kiosk/widgets/admin_keypad_dialog.dart';
 import 'package:buzi_kiosk/pages/sales_closed_page.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -15,17 +18,31 @@ class ProcessingPage extends StatefulWidget {
   State<ProcessingPage> createState() => _ProcessingPageState();
 }
 
-class _ProcessingPageState extends State<ProcessingPage> {
+class _ProcessingPageState extends State<ProcessingPage>
+    with SingleTickerProviderStateMixin {
   Timer? _timer;
   StreamSubscription<DocumentSnapshot>? _listener;
   StreamSubscription<DocumentSnapshot>? _statusListener;
   Duration _remaining = Duration.zero;
+  Duration _total = const Duration(minutes: 90);
   bool _navigated = false;
   bool _adminDialogOpen = false;
+
+  // Nabız animasyonu (süre ikonu için)
+  late AnimationController _pulseCtrl;
+  late Animation<double> _pulse;
 
   @override
   void initState() {
     super.initState();
+
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+    _pulse = Tween<double>(begin: 0.9, end: 1.0)
+        .animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+
     _startCountdown();
     _listenProcessingChanges();
     _listenStatusChanges();
@@ -72,24 +89,31 @@ class _ProcessingPageState extends State<ProcessingPage> {
   }
 
   Future<void> _startCountdown() async {
-    final docRef = FirebaseFirestore.instance.collection('machines').doc(kMachineId);
+    final docRef = FirebaseFirestore.instance
+        .collection('machines')
+        .doc(kMachineId);
     final docSnapshot = await docRef.get();
     if (!docSnapshot.exists) return;
 
     final data = docSnapshot.data();
     if (data == null ||
         !data.containsKey('processing') ||
-        data['processing'] is! Map) {
-      return;
-    }
+        data['processing'] is! Map) return;
 
     final processing = data['processing'] as Map<String, dynamic>;
     if (!processing.containsKey('until')) return;
 
     final Timestamp untilTimestamp = processing['until'];
     final until = untilTimestamp.toDate();
-    _updateRemaining(until);
 
+    // Toplam süreyi hesapla (90 dk olması lazım, ama Firestore'dan al)
+    final start = until.subtract(const Duration(minutes: 90));
+    final totalDiff = until.difference(start);
+    if (totalDiff.inSeconds > 0) {
+      setState(() => _total = totalDiff);
+    }
+
+    _updateRemaining(until);
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       _updateRemaining(until);
     });
@@ -114,13 +138,22 @@ class _ProcessingPageState extends State<ProcessingPage> {
     _timer?.cancel();
     _listener?.cancel();
     _statusListener?.cancel();
+    _pulseCtrl.dispose();
     super.dispose();
   }
 
-  String _formatDuration(Duration duration) {
-    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$minutes:$seconds';
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    if (h > 0) return '$h:$m:$s';
+    return '$m:$s';
+  }
+
+  double get _progress {
+    if (_total.inSeconds == 0) return 0;
+    final elapsed = _total.inSeconds - _remaining.inSeconds;
+    return (elapsed / _total.inSeconds).clamp(0.0, 1.0);
   }
 
   @override
@@ -169,10 +202,7 @@ class _ProcessingPageState extends State<ProcessingPage> {
                     });
                   });
                 },
-                child: const Text(
-                  '⚙️',
-                  style: TextStyle(fontSize: 36),
-                ),
+                child: const Text('⚙️', style: TextStyle(fontSize: 36)),
               ),
             ),
           ],
@@ -180,6 +210,7 @@ class _ProcessingPageState extends State<ProcessingPage> {
       ),
       body: Stack(
         children: [
+          // Arka plan
           Positioned.fill(
             child: Image.asset(
               isTurkish
@@ -189,29 +220,68 @@ class _ProcessingPageState extends State<ProcessingPage> {
               fit: BoxFit.cover,
             ),
           ),
+
+          // İlerleme çubuğu (alt kısım)
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: LinearProgressIndicator(
+              value: _progress,
+              minHeight: 6,
+              color: AppColors.bzPrimary,
+              backgroundColor: Colors.white.withOpacity(0.2),
+            ),
+          ),
+
+          // Kronometre dairesi (orijinal konumda)
           Positioned(
             left: screenWidth * 0.4,
             top: screenHeight * 0.335,
-            child: Container(
-              width: 260,
-              height: 260,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white, width: 6),
-                color: Colors.black26,
-              ),
-              alignment: Alignment.center,
-              child: Text(
-                _remaining == Duration.zero ? '' : _formatDuration(_remaining),
-                style: const TextStyle(
-                  fontSize: 64,
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  shadows: [
-                    Shadow(
-                      blurRadius: 43,
-                      color: Colors.black54,
-                      offset: Offset(2, 2),
+            child: ScaleTransition(
+              scale: _pulse,
+              child: Container(
+                width: 260,
+                height: 260,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: AppColors.bzPrimary, width: 5),
+                  color: Colors.black.withOpacity(0.35),
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppColors.bzPrimary.withOpacity(0.3),
+                      blurRadius: 30,
+                      spreadRadius: 4,
+                    )
+                  ],
+                ),
+                alignment: Alignment.center,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      _remaining == Duration.zero ? '--:--' : _fmt(_remaining),
+                      style: const TextStyle(
+                        fontSize: 58,
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        shadows: [
+                          Shadow(
+                            blurRadius: 20,
+                            color: Colors.black54,
+                            offset: Offset(2, 2),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      isTurkish ? 'kalan' : 'remaining',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.65),
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                      ),
                     ),
                   ],
                 ),

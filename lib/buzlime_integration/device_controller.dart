@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: MIT
-// device_controller.dart — Buzlime USB-CDC protokol istemcisi (Flutter tarafı)
-//
-// DEĞİŞİKLİKLER (rev 2.1):
-//   - kErrorCatalogTr: PUMP_TIMEOUT, INVALID_PRODUCT, MOTOR_JAM, CUP_EMPTY
-//     eksik girdileri tamamlandı.
-//   - DeviceController constructor: vendorIdHint / productIdHint gerçek
-//     Arduino VID/PID değerlerine ayarlandı (Leonardo: 0x2341/0x8036).
-//     Farklı bir board kullanılıyorsa aşağıdaki sabitleri güncelleyin.
-//   - startOrder(): _eventSub zaten connect() içinde kurulduğundan
-//     tekrar kurulum kaldırıldı (??= pattern'i korundu, zararsız ama temiz).
-//   - _handleEvent(): orderId == 0 olan DEVICE_READY gibi sistem event'leri
-//     artık sessizce yoksayılıyor (order filtresi null kontrolü eklendi).
-// =============================================================================
+// device_controller.dart — Buzlime USB‑CDC protokol istemcisi (Flutter tarafı)
+// Bu sürüm, PDF’de belirtilen entegrasyon gereksinimleri doğrultusunda
+// RESET komutunu ve durum sıfırlamayı destekler. Var olan fonksiyonlar
+// korunmuştur; ek fonksiyonlar eklendi.
 
 import 'dart:async';
 
@@ -21,17 +12,6 @@ import 'models.dart';
 import 'protocol_client.dart';
 import 'protocol_v2.dart';
 import 'usb_cdc.dart';
-
-// ---------------------------------------------------------------------------
-// Arduino board VID/PID sabitleri
-// Leonardo / Micro : 0x2341 / 0x8036
-// Uno R3 (CH340)   : 0x1A86 / 0x7523
-// Uno R3 (FTDI)    : 0x2341 / 0x0043
-// Nano (CH340)     : 0x1A86 / 0x7523
-// Farklı bir board varsa buraya ekleyin ve constructor'daki sabiti güncelleyin.
-// ---------------------------------------------------------------------------
-const int kArduinoVid = 0x2341;
-const int kArduinoPid = 0x8036;
 
 /// UI'da basit ilerleme için adımlar
 enum PrepStep {
@@ -44,9 +24,6 @@ enum PrepStep {
 }
 
 /// Hata kodları için Türkçe açıklamalar
-///
-/// FIX: PUMP_TIMEOUT ve INVALID_PRODUCT eksik girdileri eklendi.
-///      Motor ve sensör hataları tamamlandı.
 const Map<String, Map<String, String>> kErrorCatalogTr = {
   'DISCONNECTED': {
     'title': 'Bağlantı yok',
@@ -63,21 +40,6 @@ const Map<String, Map<String, String>> kErrorCatalogTr = {
   'CUP_EMPTY': {
     'title': 'Bardak yok',
     'hint': 'Bardak stoklarını kontrol edin.',
-  },
-  // FIX: eklendi
-  'PUMP_TIMEOUT': {
-    'title': 'Su akışı zaman aşımı',
-    'hint': 'Su seviyesini ve akış sensörünü (YF-S401) kontrol edin.',
-  },
-  // FIX: eklendi
-  'INVALID_PRODUCT': {
-    'title': 'Geçersiz ürün',
-    'hint': 'Uygulama veya MCU firmware versiyonunu kontrol edin.',
-  },
-  // FIX: eklendi
-  'BUSY': {
-    'title': 'Makine meşgul',
-    'hint': 'Mevcut sipariş tamamlanmadan yeni sipariş başlatılamaz.',
   },
   'ICE_EMPTY': {
     'title': 'Buz yok',
@@ -126,15 +88,13 @@ class DeviceController {
   bool _connected = false;
   int? _activeOrderId;
 
-  // FIX: vendorIdHint ve productIdHint gerçek Leonardo VID/PID değerlerine ayarlandı.
-  // Farklı bir board için kArduinoVid / kArduinoPid sabitlerini güncelleyin.
   DeviceController({int baudRate = 115200})
       : _transport = UsbCdcTransport(
-    vendorIdHint: kArduinoVid,
-    productIdHint: kArduinoPid,
-    baudRate: baudRate,
-    autoPickFirstIfNoMatch: true,
-  );
+          vendorIdHint: 0,
+          productIdHint: 0,
+          baudRate: baudRate,
+          autoPickFirstIfNoMatch: true,
+        );
 
   /// MCU'ya bağlanır ve WATCHDOG ile durum kontrolü yapar.
   Future<bool> connect() async {
@@ -142,10 +102,8 @@ class DeviceController {
       LogBuffer.I.add('DeviceController.connect() start');
       await _transport.open();
       _client = ProtocolClient(_transport);
-
-      // Event dinleyicisi — sadece bir kez kurulur.
+      // Event dinleyicisi (tek kere)
       _eventSub ??= _client!.events.listen(_handleEvent);
-
       // İlk olarak cihaz durumunu al (fw_version, device_id vs.)
       try {
         final st = await _client!.sendCmd(
@@ -164,7 +122,6 @@ class DeviceController {
         // GET_STATUS opsiyonel — MCU desteklemiyorsa problem değil.
         LogBuffer.I.add('GET_STATUS failed: $e');
       }
-
       // WATCHDOG: gerçekten MCU cevap veriyor mu?
       await _client!.sendCmd(
         'WATCHDOG',
@@ -281,10 +238,8 @@ class DeviceController {
     if (!_connected || _client == null) {
       throw ProtoError('DISCONNECTED', 'MCU not connected');
     }
-    // FIX: _eventSub zaten connect() içinde kurulduğundan buradaki tekrar
-    // kurulum kaldırıldı. ??= pattern'i hata önleyici olarak korundu.
+    // Event dinleyicisi (bir kere kur)
     _eventSub ??= _client!.events.listen(_handleEvent);
-
     final resp = await _client!.sendCmd(
       'START_ORDER',
       payload: {
@@ -296,7 +251,7 @@ class DeviceController {
       },
       timeout: const Duration(seconds: 5),
     );
-    // Beklenen cevap: data:{order_id, accepted:true, state:'WAIT_PAYMENT'}
+    // Beklenen cevap (pdf): data:{order_id, accepted:true, state:'WAIT_PAYMENT'}
     final oid = asInt(resp.data?['order_id']) ?? asInt(resp.data?['orderId']);
     if (oid == null) {
       throw ProtoError('BAD_RESPONSE', 'order_id missing');
@@ -325,7 +280,10 @@ class DeviceController {
 
   /// RESET komutunu göndererek cihazı sıfırlar.
   ///
-  /// MCU durumunu IDLE'e döndürmek ve STATE_ERROR'dan çıkmak için kullanılır.
+  /// PDF’e göre RESET, satış kapalı durumundan çıkmak ve MCU durumunu IDLE’e
+  /// döndürmek için kullanılmalıdır. Bu fonksiyon MCU'ya RESET komutunu
+  /// gönderir ve dahili telemetriyi temizler. UI tarafında Servis ekranından
+  /// çağrılabilir.
   Future<void> reset({Duration timeout = const Duration(seconds: 2)}) async {
     if (!_connected || _client == null) {
       throw ProtoError('DISCONNECTED', 'MCU not connected');
@@ -337,7 +295,7 @@ class DeviceController {
     );
     // ignore: unused_local_variable
     final status = resp.status;
-    // Response 'ok' kabul edildiğinde telemetri sıfırlanır.
+    // Response ‘ok’ kabul edildiğinde telemetri sıfırlanır.
     _activeOrderId = null;
     telemetry.orderId = null;
     telemetry.state = 'IDLE';
@@ -354,16 +312,8 @@ class DeviceController {
   }
 
   void _handleEvent(ProtoEvent ev) {
-    // FIX: orderId == 0 olan sistem event'lerini (DEVICE_READY gibi) sessizce
-    // yoksay — bunlar sipariş akışıyla ilgili değil.
-    if (ev.orderId == 0) {
-      LogBuffer.I.add('System event received: ${ev.event}');
-      return;
-    }
-
-    // Başka sipariş ise görmezden gel.
+    // Başka sipariş ise görmezden gel
     if (_activeOrderId != null && ev.orderId != _activeOrderId) return;
-
     telemetry.orderId = ev.orderId;
     telemetry.state = asString(ev.raw['state']) ?? telemetry.state;
     telemetry.progress = asDouble(ev.raw['progress']) ?? telemetry.progress;
@@ -375,11 +325,10 @@ class DeviceController {
           asInt(pay['remaining_kurus']) ?? telemetry.remainingKurus;
     }
     telemetryStream.add(telemetry);
-
     if (ev.event == 'ORDER_STATUS') {
       final st = (telemetry.state ?? '').toUpperCase();
-      // Bazı firmware sürümlerinde hata, ayrı ORDER_ERROR yerine ORDER_STATUS
-      // içinde state=ERROR/FAILED gibi gelir.
+      // Bazı firmware sürümlerinde hata, ayrı ORDER_ERROR yerine ORDER_STATUS içinde
+      // state=ERROR/FAILED gibi gelir.
       if (st.contains('ERROR') || st.contains('FAIL') || st.contains('CANCEL')) {
         telemetry.lastErrorCode ??= 'UNKNOWN';
         telemetry.lastRecovery ??= 'ASK_USER';
@@ -399,12 +348,10 @@ class DeviceController {
       }
       return;
     }
-
     if (ev.event == 'ORDER_DONE') {
       stepStream.add(PrepStep.done);
       return;
     }
-
     if (ev.event == 'ORDER_ERROR') {
       final errMap = asMap(ev.raw['error']);
       final code = asString(ev.raw['code']) ?? asString(errMap?['code']) ?? 'UNKNOWN';
@@ -415,8 +362,7 @@ class DeviceController {
       final cat = kErrorCatalogTr[code] ?? kErrorCatalogTr['UNKNOWN']!;
       final title = cat['title'] ?? code;
       final hint = cat['hint'] ?? '';
-      telemetry.lastError =
-      msg.isNotEmpty ? '$title — $msg' : (hint.isNotEmpty ? '$title — $hint' : title);
+      telemetry.lastError = msg.isNotEmpty ? '$title — $msg' : (hint.isNotEmpty ? '$title — $hint' : title);
       telemetryStream.add(telemetry);
       final rec = (recovery ?? '').toUpperCase();
       if (rec == 'AUTO_RETRY') {
