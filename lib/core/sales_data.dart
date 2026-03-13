@@ -3,6 +3,14 @@ import 'package:intl/intl.dart';
 import 'error_codes.dart';
 import 'app_info.dart';
 
+/// A patched version of [SalesData] that adds support for minor‑unit price
+/// recording, as required by the BuzLime design guide. In addition to the
+/// existing inventory and profit logging methods, this version exposes a
+/// `recordSale` function that writes a concise sales document containing the
+/// `drink`, `size_ml`, `price_kurus` and a server timestamp. This decouples
+/// analytics from UI strings and eliminates fragile string parsing. Existing
+/// methods (`sellSmall`, `sellLarge`, `sellDrink`, `logRefund`) remain
+/// unmodified for backwards compatibility.
 class SalesData {
   static final SalesData instance = SalesData._internal();
   SalesData._internal();
@@ -11,8 +19,7 @@ class SalesData {
   String? lastSaleCupType;
 
   Future<void> _ensureDailyLog(String day) async {
-    final logRef = _db.collection('machines').doc(machineId)
-        .collection('profit_logs').doc(day);
+    final logRef = _db.collection('machines').doc(machineId).collection('profit_logs').doc(day);
 
     await logRef.set({
       'timestamp': FieldValue.serverTimestamp(),
@@ -163,9 +170,7 @@ class SalesData {
       tx.set(logRef, {'refunds': lrefunds}, SetOptions(merge: true));
 
       final mrefunds = Map<String, dynamic>.from(mdata['refunds'] ?? {});
-      final mdetails = Map<String, dynamic>.from(
-        (mrefunds['details'] ?? {'overfreeze': 0, 'cupDrop': 0, 'other': 0}),
-      );
+      final mdetails = Map<String, dynamic>.from((mrefunds['details'] ?? {'overfreeze': 0, 'cupDrop': 0, 'other': 0}));
       mrefunds['total'] = (mrefunds['total'] ?? 0) + 1;
       mrefunds['amountTl'] = (mrefunds['amountTl'] ?? 0.0) + amountTl;
       mrefunds['amountMl'] = (mrefunds['amountMl'] ?? 0) + amountMl;
@@ -174,17 +179,13 @@ class SalesData {
       tx.set(machineRef, {'refunds': mrefunds}, SetOptions(merge: true));
     });
 
-    await machineRef
-        .collection('profit_logs')
-        .doc('refund_logs')
-        .collection(day)
-        .add({
-          'timestamp': Timestamp.fromDate(serverNow),
-          'cupType': finalCupType,
-          'errorCode': errorCode,
-          'amountTl': amountTl,
-          'amountMl': amountMl,
-        });
+    await machineRef.collection('profit_logs').doc('refund_logs').collection(day).add({
+      'timestamp': Timestamp.fromDate(serverNow),
+      'cupType': finalCupType,
+      'errorCode': errorCode,
+      'amountTl': amountTl,
+      'amountMl': amountMl,
+    });
   }
 
   Future<void> sellDrink({
@@ -261,5 +262,27 @@ class SalesData {
     });
   }
 
-
+  /// Record a concise sales document for analytics.
+  ///
+  /// The PDF mandates that sales be logged using fields that cannot be
+  /// misinterpreted by string parsing. This function writes a document into
+  /// the `sales` subcollection of the machine that contains only the drink
+  /// identifier, the pour size (in millilitres), the price in minor units
+  /// (kuruş), and a server timestamp. No inventory or profit updates are
+  /// performed here; callers should continue using the traditional
+  /// `sellSmall`, `sellLarge` or `sellDrink` functions for inventory
+  /// adjustments.
+  Future<void> recordSale({
+    required String drink,
+    required int sizeMl,
+    required int priceKurus,
+  }) async {
+    final machineRef = _db.collection('machines').doc(machineId);
+    await machineRef.collection('sales').add({
+      'drink': drink,
+      'size_ml': sizeMl,
+      'price_kurus': priceKurus,
+      'timestamp': FieldValue.serverTimestamp(),
+    });
+  }
 }

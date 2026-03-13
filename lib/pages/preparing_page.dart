@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-// PreparingPage — Buzlime sipariş takip ekranı
+// PreparingPage (patched) — Buzlime sipariş takip ekranı
 //
-// Kural:
-// - Başarılı satış (ORDER_DONE) -> satış kaydet -> Ana Menü
-// - Hata (ORDER_ERROR / süreçte kopma) -> SalesClosedPage
-// - USB/MCU yoksa (sipariş başlamadan) -> Ana Menü
+// Bu sürüm, PDF’de belirtilen satış kayıt standartlarına uyum sağlar. Satış
+// tamamlandığında hem eski `sellDrink` çağrısı ile envanter/profit kayıtları
+// güncellenir hem de `recordSale` fonksiyonu kullanılarak Firestore
+// `sales` koleksiyonuna içeriksel bir doküman yazılır. Mevcut UI akışı ve
+// step/event izleme mantığı korunmuştur.
 
 import 'dart:async';
 
@@ -22,7 +23,7 @@ class PreparingPage extends StatefulWidget {
   final String drinkCode; // 'LEMON' | 'ORANGE'
   final int sizeMl; // 300 | 400
   final String volume; // UI / sales
-  final String price; // TL string
+  final String price; // TL string (fallback)
   final int seconds; // UI animasyon temposu (sadece görsel)
 
   const PreparingPage({
@@ -205,7 +206,7 @@ class _PreparingPageState extends State<PreparingPage> with SingleTickerProvider
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const HomePage()),
-      (route) => false,
+          (route) => false,
     );
   }
 
@@ -230,6 +231,22 @@ class _PreparingPageState extends State<PreparingPage> with SingleTickerProvider
 
     // Satışı kaydet
     try {
+      // Derive price_kurus from telemetri; fallback to widget.price
+      final int? pk = _ctrl?.telemetry.priceKurus;
+      int computedKurus;
+      if (pk != null && pk > 0) {
+        computedKurus = pk;
+      } else {
+        final double tl = double.tryParse(widget.price) ?? 0.0;
+        computedKurus = (tl * 100).round();
+      }
+
+      // Hem içeriksel log hem envanter/profit güncellemesi
+      await SalesData.instance.recordSale(
+        drink: widget.drinkCode,
+        sizeMl: widget.sizeMl,
+        priceKurus: computedKurus,
+      );
       await SalesData.instance.sellDrink(
         title: _drinkTitle,
         volume: widget.volume,
@@ -244,7 +261,7 @@ class _PreparingPageState extends State<PreparingPage> with SingleTickerProvider
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const HomePage()),
-      (route) => false,
+          (route) => false,
     );
   }
 
@@ -276,9 +293,7 @@ class _PreparingPageState extends State<PreparingPage> with SingleTickerProvider
             ),
             const SizedBox(height: 30),
             Text(
-              _pickupMode
-                  ? trEn('Lütfen ürününüzü alın', 'Please take your product')
-                  : trEn('Ürününüz hazırlanıyor', 'Preparing your product'),
+              _pickupMode ? trEn('Lütfen ürününüzü alın', 'Please take your product') : trEn('Ürününüz hazırlanıyor', 'Preparing your product'),
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: Colors.white,
@@ -312,8 +327,7 @@ class _PreparingPageState extends State<PreparingPage> with SingleTickerProvider
               const SizedBox(height: 30),
               Text(
                 "${(_progress * 100).toStringAsFixed(0)}%",
-                style:
-                    const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
+                style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
               ),
             ] else ...[
               const SizedBox(height: 30),

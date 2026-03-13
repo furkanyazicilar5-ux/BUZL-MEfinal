@@ -18,6 +18,16 @@ import 'refund_animation_page.dart';
 /// - MCU ödeme (MDB) sürecini yönetir.
 /// - PAYMENT_OK görülünce PreparingPage'e geçer.
 /// - Her hata/başarısızlık -> RefundAnimation -> SalesClosed
+///
+/// FIX (rev 2.1): Race condition giderildi.
+/// Eski kodda listener, startOrder() await'inden SONRA kuruluyordu.
+/// Arduino'da gerçek ödeme modülü olmadığından MCU, START_ORDER onayının
+/// hemen ardından PREPARING event'i gönderiyordu. Bu event, Flutter
+/// listener henüz kurulmadan geldiği için sessizce düşüyor ve
+/// _goPreparing() hiç tetiklenmiyordu — motorlar çalışsa bile ekran
+/// geçmiyordu.
+/// Düzeltme: stepStream ve telemetryStream listener'ları startOrder()'dan
+/// ÖNCE kurulacak şekilde sıra değiştirildi.
 class PaymentPage extends StatefulWidget {
   final String drinkCode;
   final int sizeMl;
@@ -67,7 +77,8 @@ class _PaymentPageState extends State<PaymentPage> {
       }
       _ctrl = ctrl;
 
-      // Telemetry: bağ koptuysa hemen hata akışı
+      // FIX: Telemetry listener startOrder()'dan ÖNCE kuruldu.
+      // Bağlantı kopması anında hemen yakalansın.
       _telSub = ctrl.telemetryStream.stream.listen((t) {
         if (_navigated) return;
         if (t.state == 'DISCONNECTED') {
@@ -75,12 +86,9 @@ class _PaymentPageState extends State<PaymentPage> {
         }
       });
 
-      // Siparişi başlat
-      await ctrl.startOrder(
-        BuzlimeOrder(drinkCode: widget.drinkCode, sizeMl: widget.sizeMl),
-      );
-
-      // Step stream: ödeme ok -> preparing
+      // FIX: stepStream listener startOrder()'dan ÖNCE kuruldu.
+      // MCU, START_ORDER yanıtının hemen arkasından PREPARING event'i
+      // gönderdiğinde listener hazır olacak ve _goPreparing() tetiklenecek.
       _sub = ctrl.stepStream.stream.listen((step) {
         if (_navigated) return;
         if (step == PrepStep.paymentOk || step == PrepStep.preparing) {
@@ -89,6 +97,12 @@ class _PaymentPageState extends State<PaymentPage> {
           _goSalesClosed();
         }
       });
+
+      // Listener'lar kurulduktan SONRA siparişi başlat.
+      await ctrl.startOrder(
+        BuzlimeOrder(drinkCode: widget.drinkCode, sizeMl: widget.sizeMl),
+      );
+
     } catch (_) {
       _goSalesClosed();
     }
@@ -131,7 +145,7 @@ class _PaymentPageState extends State<PaymentPage> {
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const DrinkPage()),
-      (route) => false,
+          (route) => false,
     );
   }
 
@@ -145,8 +159,6 @@ class _PaymentPageState extends State<PaymentPage> {
 
   @override
   Widget build(BuildContext context) {
-    // Ödeme timeout'u sabit 30sn olmalı; kullanıcı ekrana dokunsa bile uzatmıyoruz.
-    // Bu yüzden InactivityWrapper yerine sabit Timer (initState) kullanıyoruz.
     return BackgroundScaffold(
       extendBodyBehindAppBar: true,
       appBar: null,
