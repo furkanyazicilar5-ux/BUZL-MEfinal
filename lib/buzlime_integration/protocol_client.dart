@@ -1,3 +1,14 @@
+// SPDX-License-Identifier: MIT
+// protocol_client.dart
+//
+// DEĞİŞİKLİKLER:
+//   - sendCmd()'den eski `params` parametresi tamamen kaldırıldı.
+//     Tüm çağrı noktaları zaten `payload:` kullanıyor; geriye dönük
+//     uyumluluk katmanına artık gerek yok.
+//   - dispose() sync wrapper'ı kaldırıldı; close() doğrudan çağrılmalı.
+//   - Pending completer'lar close() sırasında hata ile tamamlanır
+//     → timeout beklenmeden temiz kapatma sağlanır.
+
 import 'dart:async';
 import 'dart:convert';
 
@@ -5,12 +16,12 @@ import 'protocol_v2.dart';
 import '../core/log_buffer.dart';
 import 'usb_cdc.dart';
 
-/// USB-CDC üstünde request/response + event ayrıştıran hafif istemci.
+/// USB-CDC üstünde istek/yanıt + event ayrıştırıcı.
 ///
-/// PDF v2 ile uyum:
-/// - Komut: { "id":1, "type":"cmd", "cmd":"WATCHDOG", "v":2, "payload":{...} } + \n
-/// - Cevap: { "id":1, "type":"response", "cmd":"WATCHDOG", "status":"ok|busy|error", "data":{...}, "error":{...}, "v":2 }
-/// - Event: { "type":"event", "event":"ORDER_STATUS|ORDER_DONE|ORDER_ERROR", "order_id":77, ... }
+/// Protokol (PDF v2):
+///   TX: { "id":1, "type":"cmd", "cmd":"WATCHDOG", "v":2, "payload":{...} }\n
+///   RX: { "id":1, "type":"response", "cmd":"WATCHDOG", "status":"ok", "data":{...}, "v":2 }
+///   EV: { "type":"event", "event":"ORDER_STATUS", "order_id":77, ... }
 class ProtocolClient {
   final UsbCdcTransport _transport;
   late final StreamSubscription _sub;
@@ -22,67 +33,66 @@ class ProtocolClient {
   Stream<ProtoEvent> get events => _eventsCtrl.stream;
 
   ProtocolClient(this._transport) {
-    _sub = _transport.messages.listen(_onMessage, onError: (_) {}, onDone: () {});
+    _sub = _transport.messages.listen(
+      _onMessage,
+      onError: (_) {},
+      onDone: () {},
+    );
   }
 
-  /// Graceful shutdown.
-  ///
-  /// Note: transport kapanışı üst katmanda (DeviceController) yönetiliyor.
+  /// Tüm bekleyen istekleri iptal ederek kapatır.
   Future<void> close() async {
-    try {
-      await _sub.cancel();
-    } catch (_) {}
-    try {
-      await _eventsCtrl.close();
-    } catch (_) {}
+    // Bekleyen tüm completer'ları hata ile tamamla → timeout beklemeden temizlenir
+    final error = ProtoError('CLIENT_CLOSED', 'ProtocolClient kapatıldı');
+    for (final c in _pending.values) {
+      if (!c.isCompleted) c.completeError(error);
+    }
     _pending.clear();
+
+    try { await _sub.cancel(); }    catch (_) {}
+    try { await _eventsCtrl.close(); } catch (_) {}
   }
 
-  /// Back-compat: eski yerlerde sync çağrılabiliyor.
-  void dispose() {
-    // ignore: discarded_futures
-    close();
-  }
-
-  /// Komut gönderir ve response bekler.
+  /// MCU'ya komut gönderir; yanıt bekler.
   ///
-  /// Not: Eski koddan gelen `params` varsa otomatik `payload` içine taşınır.
+  /// Parametreler:
+  ///   [cmd]     – Komut adı ('WATCHDOG', 'GET_STATUS', 'START_ORDER', 'RESET')
+  ///   [payload] – İsteğe bağlı JSON nesne (yoksa alanda yer almaz)
+  ///   [timeout] – Yanıt bekleme süresi (varsayılan 5 sn)
+  ///   [v]       – Protokol versiyonu (varsayılan kProtoV=2)
   Future<ProtoResponse> sendCmd(
-    String cmd, {
-    Map<String, dynamic>? payload,
-    Map<String, dynamic>? params, // DEPRECATED: geriye dönük uyumluluk
-    Duration timeout = const Duration(seconds: 5),
-    int v = kProtoV,
-  }) async {
+      String cmd, {
+        Map<String, dynamic>? payload,
+        Duration timeout = const Duration(seconds: 5),
+        int v = kProtoV,
+      }) async {
     final id = _nextId++;
     final completer = Completer<ProtoResponse>();
     _pending[id] = completer;
 
-    // Back-compat: params -> payload
-    final effectivePayload = payload ?? (params == null ? null : Map<String, dynamic>.from(params));
-
-    final msg = {
-      'id': id,
+    final msg = <String, dynamic>{
+      'id':   id,
       'type': 'cmd',
-      'cmd': cmd,
-      'v': v,
-      if (effectivePayload != null) 'payload': effectivePayload,
+      'cmd':  cmd,
+      'v':    v,
+      if (payload != null) 'payload': payload,
     };
 
-    LogBuffer.I.add('TX ' + jsonEncode(msg));
+    LogBuffer.I.add('TX ${jsonEncode(msg)}');
     await _transport.send(msg);
 
     return completer.future.timeout(timeout, onTimeout: () {
       _pending.remove(id);
-      throw ProtoError('TIMEOUT', 'No response for $cmd (id=$id)');
+      throw ProtoError('TIMEOUT', 'Yanıt alınamadı: $cmd (id=$id)');
     });
   }
 
+  // ── Gelen mesaj işleyici ─────────────────────────────────────────────────────
   void _onMessage(Map<String, dynamic> msg) {
-    LogBuffer.I.add('RX ' + jsonEncode(msg));
+    LogBuffer.I.add('RX ${jsonEncode(msg)}');
     final type = (msg['type'] ?? '').toString();
 
-    // Response format: {v, type:'response', id, cmd, status, data?, error?}
+    // Response: { type:'response', id, cmd, status, data?, error? }
     if (type == 'response') {
       final resp = ProtoResponse.fromJson(msg);
       final c = _pending.remove(resp.id);
@@ -90,30 +100,33 @@ class ProtocolClient {
         if (resp.status == 'ok') {
           c.complete(resp);
         } else {
-          c.completeError(resp.toError() ?? ProtoError('UNKNOWN', 'Unknown error'));
+          c.completeError(resp.toError() ?? ProtoError('UNKNOWN', 'Bilinmeyen hata'));
         }
       }
       return;
     }
 
-    // Event format: {v, type:'event', event:'ORDER_STATUS', order_id, ...}
+    // Event: { type:'event', event:'ORDER_STATUS', order_id, ... }
     if (type == 'event') {
-      try {
-        final ev = ProtoEvent.fromJson(msg);
-        _eventsCtrl.add(ev);
-      } catch (_) {
-        // malformed -> ignore
-      }
+      _dispatchEvent(msg);
       return;
     }
 
-    // Bazı MCU sürümlerinde type alanı unutulabilir:
-    // - event alanı varsa event say.
-    if (type.isEmpty && msg.containsKey('event') && msg.containsKey('order_id')) {
-      try {
-        final ev = ProtoEvent.fromJson({...msg, 'type': 'event'});
-        _eventsCtrl.add(ev);
-      } catch (_) {}
+    // Bazı MCU sürümleri type alanını atlayabilir; event + order_id varsa event say.
+    if (type.isEmpty &&
+        msg.containsKey('event') &&
+        msg.containsKey('order_id')) {
+      _dispatchEvent({...msg, 'type': 'event'});
+    }
+  }
+
+  void _dispatchEvent(Map<String, dynamic> raw) {
+    try {
+      final ev = ProtoEvent.fromJson(raw);
+      if (!_eventsCtrl.isClosed) _eventsCtrl.add(ev);
+    } catch (_) {
+      // Hatalı event → yoksay, loglara düş
+      LogBuffer.I.add('EV-PARSE-ERR ${jsonEncode(raw)}');
     }
   }
 }

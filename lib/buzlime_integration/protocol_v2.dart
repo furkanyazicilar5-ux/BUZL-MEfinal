@@ -82,7 +82,12 @@ class ProtoEvent {
     final oidRaw = j.containsKey('order_id')
         ? j['order_id']
         : (j.containsKey('orderId') ? j['orderId'] : j['orderID']);
-    final oid = (oidRaw is num) ? oidRaw.toInt() : int.parse(oidRaw.toString());
+    // order_id yoksa (DEVICE_READY gibi event'ler) 0 kullan — int.parse(null) crash'ini önle
+    final oid = (oidRaw == null)
+        ? 0
+        : (oidRaw is num)
+        ? oidRaw.toInt()
+        : (int.tryParse(oidRaw.toString()) ?? 0);
     return ProtoEvent(
       event: evName,
       orderId: oid,

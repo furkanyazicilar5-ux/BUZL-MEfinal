@@ -1,81 +1,98 @@
+// SPDX-License-Identifier: MIT
 // usb_cdc.dart — COMPAT PATCH for usb_serial 0.5.2 .. 0.5.7
-// Path: lib/buzlime_integration/usb_cdc.dart
 //
-// Differences handled:
-// - Do NOT import usb_port.dart (older versions don't have it public)
-// - Do NOT call UsbSerial.requestPermission() (older versions may not expose it)
-// - Port.write(...) may return void/bool/int depending on version → don't check the return
+// DEĞİŞİKLİKLER:
+//   1) _lineBuf tampon sınırı eklendi (kLineBufMax = 2048 karakter).
+//      Satır sonu (\n) gelmeden tampon doluyorsa içerik sıfırlanır;
+//      hatalı/eksik veri nedeniyle bellek şişmesi engellenir.
+//   2) open() → _rxCtrl yeniden kullanılabilir hale getirildi.
+//      Eski close() → StreamController.close() çağrısı sonrası
+//      tekrar open() yapılırsa "Stream closed" exception olurdu.
+//      Düzeltme: _rxCtrl hiç kapatılmıyor; port hatalarında sadece
+//      port kapatılır, stream controller açık kalır.
+//   3) close() sırasında _rxCtrl.close() KALDIRILDI — DeviceController
+//      yeniden bağlandığında aynı UsbCdcTransport örneği üzerinden
+//      tekrar open() çağrılabilir; stream hâlâ dinlenebilir durumda olur.
+//      (DeviceController singleton olduğu için transport da singleton'dır.)
 //
-// Usage stays the same for the rest of the app.
+// NOT: Bu değişiklikler DeviceController._ensureReconnectLoop() içinde
+// listDevices() yeniden çağrılmasını mümkün kılar.
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
 import '../core/log_buffer.dart';
-
 import 'package:usb_serial/usb_serial.dart';
-// NOTE: Don't import usb_port.dart for compatibility.
-
 import 'device_protocol.dart';
 
 class UsbCdcTransport {
-  final int vendorIdHint;
-  final int productIdHint;
-  final int baudRate;
+  // ── Yapılandırma ─────────────────────────────────────────────────────────────
+  final int  vendorIdHint;
+  final int  productIdHint;
+  final int  baudRate;
   final bool autoPickFirstIfNoMatch;
 
+  // ── Tampon sınırı ─────────────────────────────────────────────────────────────
+  /// Satır sonu (\n) gelmeden _lineBuf bu boyutu aşarsa tampon sıfırlanır.
+  /// Hatalı / kesilmiş veri akışında bellek şişmesini önler.
+  static const int kLineBufMax = 2048;
+
+  // ── İç durum ─────────────────────────────────────────────────────────────────
   UsbPort? _port;
-  StreamSubscription<Uint8List>? _sub;
-  final _rxCtrl = StreamController<Map<String, dynamic>>.broadcast();
-  final StringBuffer _lineBuf = StringBuffer();
+  StreamSubscription<Uint8List>? _inputSub;
+
+  // _rxCtrl KAPATILMAZ — DeviceController yeniden bağlandığında
+  // aynı stream üzerinden mesaj almaya devam etmek için açık tutulur.
+  final _rxCtrl   = StreamController<Map<String, dynamic>>.broadcast();
+  final _lineBuf  = StringBuffer();
 
   Stream<Map<String, dynamic>> get messages => _rxCtrl.stream;
+  bool get isOpen => _port != null;
 
   UsbCdcTransport({
-    this.vendorIdHint = 0x2341,
-    this.productIdHint = 0x8036,
-    this.baudRate = 115200,
+    this.vendorIdHint        = 0x2341,
+    this.productIdHint       = 0x8036,
+    this.baudRate            = 115200,
     this.autoPickFirstIfNoMatch = true,
   });
 
+  // ── Bağlan ───────────────────────────────────────────────────────────────────
+  /// USB cihazını bulur, baud ayarını yapar ve veri akışını başlatır.
+  /// Zaten açıksa önce kapatır.
   Future<void> open() async {
-    LogBuffer.I.add('USB open()');
-    final devices = await UsbSerial.listDevices();
-    UsbDevice? chosen;
+    // Önceki bağlantı varsa temizle (stream controller açık kalır)
+    await _closePort();
 
+    LogBuffer.I.add('USB open(): cihaz taranıyor...');
+    final devices = await UsbSerial.listDevices();
+    LogBuffer.I.add('USB listDevices(): ${devices.length} cihaz bulundu');
+
+    UsbDevice? chosen;
     for (final d in devices) {
-      if ((d.vid == vendorIdHint) && (d.pid == productIdHint)) {
+      if (d.vid == vendorIdHint && d.pid == productIdHint) {
         chosen = d;
         break;
       }
     }
     if (chosen == null && autoPickFirstIfNoMatch && devices.isNotEmpty) {
       chosen = devices.first;
+      LogBuffer.I.add('USB: VID/PID eşleşmedi, ilk cihaz seçildi: '
+          'VID=${chosen.vid} PID=${chosen.pid}');
     }
     if (chosen == null) {
-      throw Exception("USB-CDC: Uygun cihaz bulunamadı. Cihazı takıp izin verin.");
+      throw Exception('USB-CDC: Uygun cihaz bulunamadı. '
+          'Kabloyu takın ve izin verin.');
     }
-
-    // Some versions require permission via intent-filter and prompt automatically.
-    // We avoid calling UsbSerial.requestPermission() for widest compatibility.
 
     _port = await chosen.create();
-    if (_port == null) {
-      throw Exception("USB-CDC: Port oluşturulamadı.");
-    }
+    if (_port == null) throw Exception('USB-CDC: Port oluşturulamadı.');
 
     final opened = await _port!.open();
-    if (opened != true) {
-      throw Exception("USB-CDC: Port açılamadı.");
-    }
+    if (opened != true) throw Exception('USB-CDC: Port açılamadı.');
 
-    // Older versions always return Future<void>, so we just await without checks.
     await _port!.setDTR(true);
     await _port!.setRTS(true);
-
-    // setPortParameters exists across versions; signature is (baud, dataBits, stopBits, parity)
-    // We reference constants on UsbPort via the same type to avoid extra imports.
     await _port!.setPortParameters(
       baudRate,
       UsbPort.DATABITS_8,
@@ -83,43 +100,86 @@ class UsbCdcTransport {
       UsbPort.PARITY_NONE,
     );
 
-    _sub = _port!.inputStream?.listen(_onBytes,
-        onError: (e, st) => _rxCtrl.add({'ok': false, 'err': {'reason': 'inputStream error: $e'}}),
-        cancelOnError: false);
+    // Tampon sıfırla (önceki yarım frame kalıntısı olabilir)
+    _lineBuf.clear();
+
+    _inputSub = _port!.inputStream?.listen(
+      _onBytes,
+      onError: (e) {
+        LogBuffer.I.add('USB inputStream hata: $e');
+        // Hata event'i stream'e göndermiyoruz — DeviceController watchdog yakalar
+      },
+      cancelOnError: false,
+    );
+
+    LogBuffer.I.add('USB open(): başarılı.');
   }
 
+  // ── Gelen byte işleyici ───────────────────────────────────────────────────────
   void _onBytes(Uint8List data) {
     final chunk = utf8.decode(data, allowMalformed: true);
     _lineBuf.write(chunk);
-    final txt = _lineBuf.toString();
+
+    // ── Tampon taşma koruması ────────────────────────────────────────────────
+    // Satır sonu gelmiyor ve tampon büyüyorsa: hatalı/garbled veri.
+    // Tampon içeriğini log'a at ve sıfırla.
+    if (_lineBuf.length > kLineBufMax) {
+      final preview = _lineBuf.toString().substring(0, 120);
+      LogBuffer.I.add(
+        'USB _lineBuf taşma (${_lineBuf.length} > $kLineBufMax): sıfırlanıyor. '
+            'Önizleme: $preview…',
+      );
+      _lineBuf.clear();
+      return;
+    }
+
+    // ── Satır bazlı JSON ayrıştırma ──────────────────────────────────────────
+    final txt   = _lineBuf.toString();
     final parts = txt.split('\n');
+
+    // Son parça: henüz tamamlanmamış satır — tamponda sakla
     for (int i = 0; i < parts.length - 1; i++) {
       final line = parts[i].trim();
       if (line.isEmpty) continue;
+
       final j = tryDecode(line);
       if (j != null) {
-        _rxCtrl.add(j);
+        if (!_rxCtrl.isClosed) _rxCtrl.add(j);
       } else {
-        final short = line.length > 200 ? line.substring(0, 200) + '…' : line;
-        LogBuffer.I.add('RX-RAW ' + short);
+        final preview = line.length > 200 ? '${line.substring(0, 200)}…' : line;
+        LogBuffer.I.add('USB RX-RAW (JSON değil): $preview');
       }
     }
+
     _lineBuf.clear();
-    _lineBuf.write(parts.last);
+    _lineBuf.write(parts.last); // tamamlanmamış satırı geri koy
   }
 
+  // ── Gönder ───────────────────────────────────────────────────────────────────
   Future<void> send(Map<String, dynamic> json) async {
-    final line = encode(json); // adds trailing \n
+    if (_port == null) {
+      LogBuffer.I.add('USB send(): port kapalı, mesaj atlandı.');
+      return;
+    }
+    final line  = encode(json); // encode() sona \n ekler
     final bytes = Uint8List.fromList(utf8.encode(line));
-    await _port?.write(bytes); // return type may be void/bool/int → don't check
+    await _port?.write(bytes); // dönüş tipi sürüme göre void/bool/int → kontrol yok
   }
 
+  // ── Kapat ────────────────────────────────────────────────────────────────────
+  /// Portu ve input stream aboneliğini kapatır.
+  /// _rxCtrl KAPATILMAZ — bir sonraki open() sonrası stream hâlâ dinlenebilir.
   Future<void> close() async {
     LogBuffer.I.add('USB close()');
-    await _sub?.cancel();
-    _sub = null;
+    await _closePort();
+  }
+
+  // ── Yardımcı: sadece port kaynaklarını serbest bırak ────────────────────────
+  Future<void> _closePort() async {
+    await _inputSub?.cancel();
+    _inputSub = null;
     try { await _port?.close(); } catch (_) {}
     _port = null;
-    await _rxCtrl.close();
+    _lineBuf.clear(); // Artık geçersiz olan kısmi veriyi temizle
   }
 }

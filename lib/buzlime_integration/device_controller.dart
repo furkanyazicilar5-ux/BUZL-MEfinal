@@ -90,11 +90,11 @@ class DeviceController {
 
   DeviceController({int baudRate = 115200})
       : _transport = UsbCdcTransport(
-          vendorIdHint: 0,
-          productIdHint: 0,
-          baudRate: baudRate,
-          autoPickFirstIfNoMatch: true,
-        );
+    vendorIdHint: 0,
+    productIdHint: 0,
+    baudRate: baudRate,
+    autoPickFirstIfNoMatch: true,
+  );
 
   /// MCU'ya bağlanır ve WATCHDOG ile durum kontrolü yapar.
   Future<bool> connect() async {
@@ -265,9 +265,25 @@ class DeviceController {
     telemetry.state = asString(resp.data?['state']) ?? 'WAIT_PAYMENT';
     telemetry.priceKurus = asInt(resp.data?['price_kurus']);
     telemetryStream.add(telemetry);
-    // İlk adım: ödeme bekleniyor
+
+    // SİPARİŞ AKTIF: Arduino bloklayan senaryo kodu çalışacak (stepper, delay,
+    // 120sn pickup bekleme…). Bu süre zarfında WATCHDOG'a cevap veremez →
+    // miss >= 3 → sahte DISCONNECT → SalesClosedPage. Watchdog'u durdur.
+    // ORDER_DONE veya ORDER_ERROR gelince _resumeWatchdog() ile yeniden başlar.
+    _stopWatchdog();
+    LogBuffer.I.add('Watchdog paused — order $oid active');
+
     stepStream.add(PrepStep.waitPayment);
     return oid;
+  }
+
+  /// Sipariş bittikten sonra watchdog'u yeniden başlat.
+  void _resumeWatchdog() {
+    if (!_connected) return;
+    _watchdogMiss = 0;
+    _activeOrderId = null;
+    _startWatchdog();
+    LogBuffer.I.add('Watchdog resumed');
   }
 
   /// GET_STATUS komutunu gönderir ve MCU'dan yanıt döndürür.
@@ -312,58 +328,77 @@ class DeviceController {
   }
 
   void _handleEvent(ProtoEvent ev) {
-    // Başka sipariş ise görmezden gel
+    // orderId=0 → DEVICE_READY gibi sipariş dışı event → yoksay
+    if (ev.orderId == 0) return;
+    // Başka siparişin event'i → yoksay
     if (_activeOrderId != null && ev.orderId != _activeOrderId) return;
-    telemetry.orderId = ev.orderId;
-    telemetry.state = asString(ev.raw['state']) ?? telemetry.state;
+
+    telemetry.orderId  = ev.orderId;
+    telemetry.state    = asString(ev.raw['state']) ?? telemetry.state;
     telemetry.progress = asDouble(ev.raw['progress']) ?? telemetry.progress;
     final pay = asMap(ev.raw['payment']);
     if (pay != null) {
-      telemetry.priceKurus = asInt(pay['price_kurus']) ?? telemetry.priceKurus;
-      telemetry.paidKurus = asInt(pay['paid_kurus']) ?? telemetry.paidKurus;
-      telemetry.remainingKurus =
-          asInt(pay['remaining_kurus']) ?? telemetry.remainingKurus;
+      telemetry.priceKurus     = asInt(pay['price_kurus'])     ?? telemetry.priceKurus;
+      telemetry.paidKurus      = asInt(pay['paid_kurus'])      ?? telemetry.paidKurus;
+      telemetry.remainingKurus = asInt(pay['remaining_kurus']) ?? telemetry.remainingKurus;
     }
     telemetryStream.add(telemetry);
+
+    // ── ORDER_STATUS ────────────────────────────────────────────────────────
     if (ev.event == 'ORDER_STATUS') {
       final st = (telemetry.state ?? '').toUpperCase();
-      // Bazı firmware sürümlerinde hata, ayrı ORDER_ERROR yerine ORDER_STATUS içinde
-      // state=ERROR/FAILED gibi gelir.
-      if (st.contains('ERROR') || st.contains('FAIL') || st.contains('CANCEL')) {
+
+      // Firmware hata state'lerini ORDER_STATUS içinde gönderebilir.
+      // "DELIVERY_OPEN", "HOMING", "FILLING" gibi geçerli state'lerin
+      // yanlışlıkla hata olarak algılanmaması için tam eşleşme kullanılır.
+      const errorStates = {'ERROR', 'ORDER_ERROR', 'FAILED', 'CANCELLED', 'CANCELED'};
+      if (errorStates.contains(st)) {
         telemetry.lastErrorCode ??= 'UNKNOWN';
-        telemetry.lastRecovery ??= 'ASK_USER';
-        final cat = kErrorCatalogTr[telemetry.lastErrorCode] ??
-            kErrorCatalogTr['UNKNOWN']!;
+        telemetry.lastRecovery  ??= 'ASK_USER';
+        final cat = kErrorCatalogTr[telemetry.lastErrorCode] ?? kErrorCatalogTr['UNKNOWN']!;
         telemetry.lastError = cat['title'] ?? telemetry.lastErrorCode;
         telemetryStream.add(telemetry);
+        _resumeWatchdog();
         stepStream.add(PrepStep.error);
         return;
       }
-      if (st.contains('WAIT_PAYMENT')) {
+
+      // Normal akış state'leri → UI'a ilet
+      if (st == 'WAIT_PAYMENT') {
         stepStream.add(PrepStep.waitPayment);
-      } else if (st.contains('PAYMENT_OK')) {
+      } else if (st == 'PAYMENT_OK') {
         stepStream.add(PrepStep.paymentOk);
       } else {
+        // PREPARING, DISPENSE_CUP, VALVE, FILLING, DELIVERY,
+        // DELIVERY_OPEN, HOMING ve bilinmeyen tüm state'ler → preparing
         stepStream.add(PrepStep.preparing);
       }
       return;
     }
+
+    // ── ORDER_DONE ──────────────────────────────────────────────────────────
     if (ev.event == 'ORDER_DONE') {
+      _resumeWatchdog(); // Sipariş bitti → watchdog yeniden başlat
       stepStream.add(PrepStep.done);
       return;
     }
+
+    // ── ORDER_ERROR ─────────────────────────────────────────────────────────
     if (ev.event == 'ORDER_ERROR') {
-      final errMap = asMap(ev.raw['error']);
-      final code = asString(ev.raw['code']) ?? asString(errMap?['code']) ?? 'UNKNOWN';
-      final msg = asString(ev.raw['msg']) ?? asString(errMap?['msg']) ?? '';
-      final recovery = asString(ev.raw['recovery']) ?? asString(errMap?['recovery']);
+      final errMap  = asMap(ev.raw['error']);
+      final code    = asString(ev.raw['code'])     ?? asString(errMap?['code'])     ?? 'UNKNOWN';
+      final msg     = asString(ev.raw['msg'])      ?? asString(errMap?['msg'])      ?? '';
+      final recovery= asString(ev.raw['recovery']) ?? asString(errMap?['recovery']);
       telemetry.lastErrorCode = code;
-      telemetry.lastRecovery = recovery;
-      final cat = kErrorCatalogTr[code] ?? kErrorCatalogTr['UNKNOWN']!;
+      telemetry.lastRecovery  = recovery;
+      final cat   = kErrorCatalogTr[code] ?? kErrorCatalogTr['UNKNOWN']!;
       final title = cat['title'] ?? code;
-      final hint = cat['hint'] ?? '';
-      telemetry.lastError = msg.isNotEmpty ? '$title — $msg' : (hint.isNotEmpty ? '$title — $hint' : title);
+      final hint  = cat['hint']  ?? '';
+      telemetry.lastError = msg.isNotEmpty
+          ? '$title — $msg'
+          : (hint.isNotEmpty ? '$title — $hint' : title);
       telemetryStream.add(telemetry);
+      _resumeWatchdog(); // Sipariş hatayla bitti → watchdog yeniden başlat
       final rec = (recovery ?? '').toUpperCase();
       if (rec == 'AUTO_RETRY') {
         stepStream.add(PrepStep.preparing);

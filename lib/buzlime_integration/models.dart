@@ -1,80 +1,62 @@
 // SPDX-License-Identifier: MIT
+// models.dart
 //
-// models.dart — Ortak modeller
-//
-// Not: Bu dosya, eski (v1) komut kuyruğu + yeni (v2) sipariş protokolü için
-// minimum ortak veri tiplerini içerir.
+// DEĞİŞİKLİKLER:
+//   - V1 Cmd sınıfı tamamen silindi (donanım test artığı, hiçbir V2 kodu kullanmıyor).
+//   - Json typedef korundu (protocol_v2.dart + diğerleri kullanıyor).
+//   - Telemetry: priceKurus, paidKurus, remainingKurus, changeKurus korundu;
+//     bu alanlar MCU'dan gelen ödeme bilgilerini pasif olarak yansıtır
+//     (uygulama bu değerleri göndermez, sadece okur — otorite MCU/MDB'de).
+//   - copy() metodu güncellendi.
 
 typedef Json = Map<String, dynamic>;
 
-/// (Legacy) Basit komut formatı (v=1).
-/// Bazı test/diagnostic akışlarında hâlâ kullanılabilir.
-class Cmd {
-  final String type; // 'cmd' | 'read'
-  final String name; // M1/M2/M3/... | RELAY | TEMP | TOF
-  final String? dir; // 'F' | 'B'
-  final Json? data;
-  final String? state; // 'ON' | 'OFF'
-  final String id;
+// ─── V1 Cmd sınıfı KALDIRILDI ─────────────────────────────────────────────────
+// Eski donanım test protokolü (v=1) projede artık kullanılmıyor.
+// Tüm komutlar protocol_v2.dart üzerinden ProtocolClient.sendCmd() ile gönderilir.
+// ─────────────────────────────────────────────────────────────────────────────────
 
-  Cmd({
-    required this.type,
-    required this.name,
-    this.dir,
-    this.data,
-    this.state,
-    required this.id,
-  });
-
-  Json toJson() => <String, dynamic>{
-        'v': 1,
-        'type': type,
-        'name': name,
-        if (dir != null) 'dir': dir,
-        if (state != null) 'state': state,
-        if (data != null) 'data': data,
-        'id': id,
-      };
-}
-
-/// Sipariş akışı için UI tarafında gösterilecek kaba adımlar.
-
-/// UI tarafında gösterim/teşhis için telemetri.
+/// UI tarafında gösterim ve teşhis için telemetri modeli.
+///
+/// ÖNEMLI: Bu model yalnızca MCU'dan gelen verileri yansıtır.
+/// Uygulama tarafı hiçbir zaman fiyat veya ödeme verisi göndermez;
+/// tüm fiyat/ödeme otoritesi MCU/MDB'ye aittir.
 class Telemetry {
-  // Genel
+  // ── Hata bilgisi ─────────────────────────────────────────────────────────────
   String? lastError;
   String? lastErrorCode;
   String? lastRecovery;
 
-  // Cihaz kimliği
+  // ── Cihaz kimliği ─────────────────────────────────────────────────────────────
   String? deviceId;
   String? fwVersion;
 
-  // Protokol v2 (sipariş bazlı)
-  int? orderId;
-  String? state; // WAIT_PAYMENT, PAYMENT_OK, DISPENSE_CUP, ...
-  double? progress; // 0.0 - 1.0
+  // ── Sipariş durumu (MCU'dan gelir, v2) ────────────────────────────────────────
+  int?    orderId;
+  String? state;    // WAIT_PAYMENT | PAYMENT_OK | DISPENSE_CUP | FILLING | ...
+  double? progress; // 0.0 – 1.0 (MCU iletir, uygulama okur)
 
-  // Ödeme alanı (opsiyonel)
-  int? priceKurus;
-  int? paidKurus;
-  int? remainingKurus;
-  int? changeKurus;
+  // ── Ödeme bilgisi (MCU/MDB'den pasif olarak okunur, uygulama göndermez) ────────
+  int? priceKurus;     // MCU'nun belirlediği fiyat (kuruş)
+  int? paidKurus;      // Ödenen miktar
+  int? remainingKurus; // Kalan miktar
+  int? changeKurus;    // Para üstü
 
+  /// Derin kopya — telemetryStream'e gönderilirken referans paylaşımını önler.
+  /// Dinleyici eski snapshot'ı değişmez biçimde tutabilir.
   Telemetry copy() {
-    final t = Telemetry();
-    t.lastError = lastError;
-    t.lastErrorCode = lastErrorCode;
-    t.lastRecovery = lastRecovery;
-    t.deviceId = deviceId;
-    t.fwVersion = fwVersion;
-    t.orderId = orderId;
-    t.state = state;
-    t.progress = progress;
-    t.priceKurus = priceKurus;
-    t.paidKurus = paidKurus;
-    t.remainingKurus = remainingKurus;
-    t.changeKurus = changeKurus;
-    return t;
+    return Telemetry()
+      ..lastError       = lastError
+      ..lastErrorCode   = lastErrorCode
+      ..lastRecovery    = lastRecovery
+      ..deviceId        = deviceId
+      ..fwVersion       = fwVersion
+      ..orderId         = orderId
+      ..state           = state
+      ..progress        = progress
+      ..priceKurus      = priceKurus
+      ..paidKurus       = paidKurus
+      ..remainingKurus  = remainingKurus
+      ..changeKurus     = changeKurus;
   }
 }

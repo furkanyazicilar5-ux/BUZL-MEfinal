@@ -1,72 +1,62 @@
 // SPDX-License-Identifier: MIT
 // integration_entry.dart — Buzlime sipariş başlatma ve servis entegrasyon noktası
-// Bu revizyon PDF gereksinimlerine uygun olarak RESET fonksiyonunu ekler.
-
-import 'package:flutter/material.dart';
+//
+// DEĞİŞİKLİKLİK:
+//   - startBuzlimeOrder() imzasından `priceKurus` parametresi tamamen kaldırıldı.
+//     Fiyat ve ödeme otoritesi yalnızca MCU/MDB'dedir; uygulama fiyat göndermez.
+//   - BuzlimeOrder constructor çağrısından priceKurus alanı silindi.
+//   - Dönen durum string'leri ve hata mantığı korundu.
 
 import 'device_controller.dart';
 
-/// Uygulama boyunca tek bir DeviceController örneği kullanıyoruz.
+/// Uygulama boyunca tek bir DeviceController örneği kullanılır (singleton).
 final DeviceController _dev = DeviceController();
 
+/// Singleton DeviceController erişimi.
 DeviceController getDeviceController() => _dev;
 
-/// USB + MCU hazır mı? (connect içinde WATCHDOG var)
-Future<bool> ensureDeviceConnected() async {
-  return _dev.connect();
-}
+/// USB + MCU bağlantısını test eder (connect() içinde WATCHDOG gönderilir).
+Future<bool> ensureDeviceConnected() async => _dev.connect();
 
 /// Siparişi başlatır.
 ///
-/// [drinkCode]: 'LEMON' | 'ORANGE'
-/// [sizeMl]: 300 | 400
-/// [priceKurus]: örn 4000 (40 TL) — MCU'da otorite olduğu için opsiyoneldir.
+/// [drinkCode] : 'LEMON' | 'ORANGE'
+/// [sizeMl]    : 300 | 400
 ///
 /// Dönen durumlar:
-/// - 'no_usb' : USB/MCU bağlanamadı (satış yok, ana menüye dön)
-/// - 'started' : Sipariş kabul edildi (bundan sonra event beklenir)
-/// - 'error' : Başlatma hatası (SalesClosedPage'e gideceğiz)
+///   'started' — Sipariş MCU tarafından kabul edildi; event bekleniyor.
+///   'error'   — Bağlantı hatası veya MCU reddi; SalesClosedPage'e yönlendirin.
 Future<String> startBuzlimeOrder({
   required String drinkCode,
   required int sizeMl,
-  int? priceKurus,
 }) async {
-  // 1) USB + MCU bağlan (connect içinde WATCHDOG atılıyor)
+  // 1) Bağlan (zaten bağlıysa hızlıca döner)
   final ok = await _dev.connect();
-  if (!ok) {
-    // MCU yoksa da "hata" kabul ediyoruz => SalesClosed
-    return 'error';
-  }
-  // 2) Sipariş oluştur ve başlat
+  if (!ok) return 'error';
+
+  // 2) Sipariş oluştur ve gönder — fiyat bilgisi YOK (MCU/MDB yetkisinde)
   try {
-    final order = BuzlimeOrder(
-      drinkCode: drinkCode,
-      sizeMl: sizeMl,
-      priceKurus: priceKurus,
+    await _dev.startOrder(
+      BuzlimeOrder(drinkCode: drinkCode, sizeMl: sizeMl),
     );
-    await _dev.startOrder(order);
     return 'started';
   } catch (_) {
-    // Buraya düştüyse:
-    // - MCU busy olabilir
-    // - START_ORDER reddedilmiş olabilir
-    // - cevap formatı bozuk olabilir
+    // MCU meşgul, reddetti veya format hatası
     return 'error';
   }
 }
 
-/// Cihazı RESET komutu ile sıfırlar.
+/// MCU'yu RESET komutu ile sıfırlar.
 ///
-/// Bu fonksiyon, servis personeli tarafından satış kapalı durumu oluştuğunda
-/// çağrılmalıdır. MCU'ya RESET komutunu yollar ve durumun reset edildiğini
-/// bildirir. Başarılı olursa 'reset', bağlantı yoksa 'no_usb', hata
-/// oluşursa 'error' döner.
+/// Satış kapalı durumundan çıkmak için servis personeli çağırır.
+///
+/// Dönen durumlar:
+///   'reset'  — RESET başarılı.
+///   'no_usb' — USB/MCU bağlanamadı.
+///   'error'  — RESET komutu başarısız.
 Future<String> resetBuzlimeDevice() async {
-  // Cihaza bağlanmayı dene; halihazırda bağlıysa connect() true döndürür.
   final ok = await _dev.connect();
-  if (!ok) {
-    return 'no_usb';
-  }
+  if (!ok) return 'no_usb';
   try {
     await _dev.reset();
     return 'reset';
@@ -75,7 +65,5 @@ Future<String> resetBuzlimeDevice() async {
   }
 }
 
-/// Uygulama kapanırken veya kesin kapatmak istersen.
-Future<void> disposeDevice() async {
-  await _dev.close();
-}
+/// Uygulama kapanırken ya da cihazı kesin kapatmak istediğinde çağrılır.
+Future<void> disposeDevice() async => _dev.close();

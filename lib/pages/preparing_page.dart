@@ -1,42 +1,16 @@
 // SPDX-License-Identifier: MIT
-// preparing_page.dart — v4
+// preparing_page.dart — v5
 //
-// ─── HATA ANALİZİ & DÜZELTMELER ─────────────────────────────────────────────
-//
-// KIRMIZI EKRAN NEDENLERİ:
-//
-// 1. SingleTickerProviderStateMixin + 2 AnimationController
-//    → Flutter yalnızca 1 ticker tahsis eder; ikinci controller oluşturulunca
-//      "A Ticker was created by _PreparingPageState but was never disposed" /
-//      "Too many tickers" assertion hatası verir → kırmızı ekran.
-//    DÜZELTME: TickerProviderStateMixin kullanıldı.
-//
-// 2. _uiTimer her 50 ms setState() çağırıyor
-//    → Frame pipeline dolu olduğunda "setState() called during build"
-//      veya "setState() after dispose()" exception → kırmızı ekran.
-//    DÜZELTME: Timer tamamen kaldırıldı. Progress yalnızca
-//    AnimationController.animateTo() ile yumuşatılıyor (setState yok).
-//
-// 3. connect() çift çağrısı (PaymentPage + PreparingPage)
-//    → UsbCdcTransport zaten açıkken tekrar open() çağrılır,
-//      _rxCtrl kapalıysa "Bad state: Cannot add to a closed stream" → crash.
-//    DÜZELTME: isConnected kontrolü korundu; connect() sadece gerekirse çağrılır.
-//    Ayrıca UsbCdcTransport.close() → _rxCtrl.close() zinciri kırılmaz.
-//
-// 4. Image.asset() → asset yoksa "Unable to load asset" exception
-//    → kırmızı ekran. DÜZELTME: errorBuilder eklendi; asset bulunamazsa
-//      yedek ikon gösterilir, uygulama çökmez.
-//
-// ─── ARDUINO PARALEL PROGRESS ────────────────────────────────────────────────
-//
-//  Arduino ORDER_STATUS event'indeki progress (0.0–1.0) doğrudan bara yansır.
-//  Arduino sessizse _FallbackTicker yavaşça ilerler (max %90 tavanı).
-//  ORDER_DONE → %100 → 2 sn bekle → HomePage.
-//  Her hata → SalesClosedPage(autoReturnHome: false).
-//
-// ─────────────────────────────────────────────────────────────────────────────
+// YENİLİKLER:
+//   - Arduino DELIVERY_OPEN event'i → Pickup ekranı ("Buzlime Hazır!" / "İçeceğiniz Hazır!")
+//   - İçeceğe göre farklı mesaj: LEMON → "Buzlime Hazır! Afiyet olsun 🍋"
+//                                 ORANGE → "İçeceğiniz Hazır! Afiyet olsun 🍊"
+//   - Pickup ekranında animasyonlu kutlama efekti (scale + fade pulse)
+//   - "Bardağınızı alın" ikinci satır talimatı
+//   - ORDER_DONE gelince satış kaydedilip HomePage'e geçiliyor
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../buzlime_integration/device_controller.dart';
@@ -48,13 +22,13 @@ import '../widgets/background_scaffold.dart';
 import '../home_page.dart';
 import 'sales_closed_page.dart';
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
 class PreparingPage extends StatefulWidget {
   final String drinkCode; // 'LEMON' | 'ORANGE'
-  final int sizeMl;       // 300 | 400
+  final int    sizeMl;    // 300 | 400
   final String volume;    // '300ml' | '400ml'
   final String price;     // '30' | '45'
-  final int seconds;      // tahmini hazırlık süresi (fallback için)
+  final int    seconds;   // tahmini hazırlık süresi
 
   const PreparingPage({
     super.key,
@@ -69,7 +43,7 @@ class PreparingPage extends StatefulWidget {
   State<PreparingPage> createState() => _PreparingPageState();
 }
 
-// ─── TickerProviderStateMixin: 2 AnimationController için zorunlu ─────────────
+// ─── TickerProviderStateMixin: birden fazla AnimationController için zorunlu ──
 class _PreparingPageState extends State<PreparingPage>
     with TickerProviderStateMixin {
 
@@ -78,37 +52,54 @@ class _PreparingPageState extends State<PreparingPage>
   StreamSubscription? _telSub;
   bool _finished = false;
 
-  // ── Progress durumu (setState'siz; AnimatedBuilder ile render) ───────────────
-  double _arduinoProgress = 0.0; // Arduino'dan gelen en yüksek değer
-  double _targetProgress  = 0.0; // Animasyonun hedefi (geri gitmez)
-
-  // ── UI durumu (setState gerektirir) ─────────────────────────────────────────
-  bool _arduinoSynced = false; // Arduino veri gönderdi mi?
-  bool _pickupMode    = false; // Teslim kapısı açıldı mı?
-  String _mcuState    = '';    // Arduino'dan gelen son state string'i
+  // ── Progress durumu ──────────────────────────────────────────────────────────
+  double _arduinoProgress = 0.0;
+  double _targetProgress  = 0.0;
+  bool   _arduinoSynced   = false;
+  bool   _pickupMode      = false; // DELIVERY_OPEN geldi
+  String _mcuState        = '';
 
   // ── AnimationController 1: ilerleme çubuğu ──────────────────────────────────
-  // .animateTo() ile setState olmadan smooth güncelleme yapılır.
-  // AnimatedBuilder bu controller'ı dinler → otomatik rebuild.
   late final AnimationController _barCtrl;
 
-  // ── AnimationController 2: ikon nabzı ───────────────────────────────────────
+  // ── AnimationController 2: ikon nabzı (hazırlık sırasında) ──────────────────
   late final AnimationController _pulseCtrl;
   late final Animation<double>   _pulseAnim;
 
-  // ── Fallback timer: Arduino yoksa yavaş ilerleme ─────────────────────────────
+  // ── AnimationController 3: pickup kutlama efekti ────────────────────────────
+  late final AnimationController _celebCtrl;
+  late final Animation<double>   _celebScale;
+  late final Animation<double>   _celebOpacity;
+
+  // ── Fallback timer ───────────────────────────────────────────────────────────
   Timer? _fallbackTimer;
   Timer? _hardTimeout;
   int    _fallbackElapsedMs = 0;
   late final int _totalMs;
+  late final int _hardSec;
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  String get _drinkTitle => widget.drinkCode == 'LEMON'
+  // ── Getters ──────────────────────────────────────────────────────────────────
+  bool get _isLemon => widget.drinkCode == 'LEMON';
+
+  String get _drinkTitle => _isLemon
       ? trEn('Limon', 'Lemon')
       : trEn('Portakal', 'Orange');
 
-  String get _statusLabel {
-    if (_pickupMode) return trEn('Ürününüzü alın', 'Take your product');
+  /// Ana başlık mesajı — pickup modunda içeceğe özgü
+  String get _headlineText {
+    if (!_pickupMode) return _preparingLabel;
+    return _isLemon
+        ? trEn('Buzlime Hazır! 🍋', 'Buzlime Ready! 🍋')
+        : trEn('İçeceğiniz Hazır! 🍊', 'Your Drink is Ready! 🍊');
+  }
+
+  /// İkinci satır talimatı
+  String get _subtitleText {
+    if (!_pickupMode) return '$_drinkTitle  •  ${widget.volume}';
+    return trEn('Bardağınızı alın, afiyet olsun!', 'Please take your cup, enjoy!');
+  }
+
+  String get _preparingLabel {
     final up = _mcuState.toUpperCase();
     if (up.contains('CUP') || up.contains('DISPENSE'))
       return trEn('Bardak hazırlanıyor', 'Preparing cup');
@@ -116,28 +107,25 @@ class _PreparingPageState extends State<PreparingPage>
       return trEn('Dolum yapılıyor', 'Filling drink');
     if (up.contains('VALVE'))
       return trEn('Vana açılıyor', 'Opening valve');
-    if (up.contains('PREPARING') || up.contains('WAIT'))
-      return trEn('Ürününüz hazırlanıyor', 'Preparing your product');
     return trEn('Ürününüz hazırlanıyor', 'Preparing your product');
   }
 
-  // ═════════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   @override
   void initState() {
     super.initState();
     _totalMs = (widget.seconds * 1000).clamp(5000, 120000);
 
-    // ── AnimationController: ilerleme çubuğu ──────────────────────────────────
+    // ── İlerleme çubuğu ────────────────────────────────────────────────────
     _barCtrl = AnimationController(
       vsync: this,
       value: 0.0,
       lowerBound: 0.0,
       upperBound: 1.0,
-      // duration kullanmıyoruz; animateTo() her seferinde kendi duration'ını alır
       duration: const Duration(milliseconds: 1),
     );
 
-    // ── AnimationController: nabız ────────────────────────────────────────────
+    // ── Hazırlık nabzı ──────────────────────────────────────────────────────
     _pulseCtrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1100),
@@ -146,55 +134,71 @@ class _PreparingPageState extends State<PreparingPage>
       CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
     );
 
-    // ── Fallback timer ─────────────────────────────────────────────────────────
-    // Arduino sessizse her 300ms'de yavaşça ilerliyoruz (max %90)
+    // ── Pickup kutlama animasyonu ────────────────────────────────────────────
+    // Döngüsel: scale 0.95 → 1.05 → 0.95 + hafif opacity titremesi
+    _celebCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    );
+    _celebScale = Tween<double>(begin: 0.96, end: 1.04).animate(
+      CurvedAnimation(parent: _celebCtrl, curve: Curves.easeInOut),
+    );
+    _celebOpacity = Tween<double>(begin: 0.85, end: 1.0).animate(
+      CurvedAnimation(parent: _celebCtrl, curve: Curves.easeInOut),
+    );
+
+    // ── Fallback timer ──────────────────────────────────────────────────────
     _fallbackTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
-      if (_finished) return;
+      if (_finished || _pickupMode) return;
       _fallbackElapsedMs += 300;
       if (_fallbackElapsedMs > _totalMs) _fallbackElapsedMs = _totalMs;
       final fp = (_fallbackElapsedMs / _totalMs).clamp(0.0, 0.90);
-      // Sadece Arduino'nun gerisindeyse fallback ilerler
       _animateTo(fp);
     });
 
-    // ── Hard timeout ──────────────────────────────────────────────────────────
-    final hardSec = (widget.seconds + 45).clamp(60, 300);
-    _hardTimeout = Timer(Duration(seconds: hardSec), () {
+    // ── Hard timeout ────────────────────────────────────────────────────────
+    // Arduino'dan event geldikçe sıfırlanır (_resetHardTimeout).
+    // İlk değer: Arduino senaryosu + pickup bekleme süresini kapsamalı.
+    _hardSec = (widget.seconds + 60).clamp(120, 300);
+    _hardTimeout = Timer(Duration(seconds: _hardSec), () {
       if (!_finished && mounted) _goSalesClosed();
     });
 
-    // ── Arduino bağlantısı ────────────────────────────────────────────────────
     _startOrderFlow();
   }
 
-  // ── Smooth progress animasyonu (setState YOK → build güvenli) ────────────────
+  // ── Smooth progress (setState YOK) ─────────────────────────────────────────
   void _animateTo(double target) {
-    final clamped = target.clamp(0.0, 1.0);
-    if (clamped <= _targetProgress) return; // asla geri gitme
-    _targetProgress = clamped;
-    // AnimationController.animateTo → AnimatedBuilder rebuild tetikler
-    _barCtrl.animateTo(
-      clamped,
-      duration: const Duration(milliseconds: 500),
-      curve: Curves.easeOut,
-    );
+    final v = target.clamp(0.0, 1.0);
+    if (v <= _targetProgress) return;
+    _targetProgress = v;
+    _barCtrl.animateTo(v,
+        duration: const Duration(milliseconds: 500), curve: Curves.easeOut);
   }
 
-  // ── Arduino bağlantı akışı ────────────────────────────────────────────────────
+  // ── Arduino event geldiğinde hard timeout'u sıfırla ─────────────────────────
+  // Arduino event göndermeye devam ettiği sürece timeout tetiklenmez.
+  // Event kesilirse (gerçek hata/kopma) timeout devreye girer.
+  void _resetHardTimeout() {
+    if (_finished || _pickupMode) return;
+    _hardTimeout?.cancel();
+    _hardTimeout = Timer(Duration(seconds: _hardSec), () {
+      if (!_finished && mounted) _goSalesClosed();
+    });
+  }
+
+  // ── Arduino bağlantı akışı ─────────────────────────────────────────────────
   Future<void> _startOrderFlow() async {
     try {
       final ctrl = getDeviceController();
-
-      // Zaten bağlıysa (PaymentPage'den geldi) tekrar connect() çağırma
       if (!ctrl.isConnected) {
-        final ok = await ctrl.connect();
-        if (!ok) {
+        if (!await ctrl.connect()) {
           if (mounted) _goSalesClosed();
           return;
         }
       }
 
-      // ── PrepStep stream ────────────────────────────────────────────────────
+      // PrepStep stream
       _stepSub = ctrl.stepStream.stream.listen((step) async {
         if (_finished) return;
         switch (step) {
@@ -207,40 +211,39 @@ class _PreparingPageState extends State<PreparingPage>
         }
       });
 
-      // ── Telemetry stream: Arduino'dan gelen gerçek progress ────────────────
+      // Telemetry stream
       _telSub = ctrl.telemetryStream.stream.listen((t) {
         if (_finished || !mounted) return;
-
-        // Bağlantı kesildi
         if (t.state == 'DISCONNECTED') { _goSalesClosed(); return; }
 
-        // State string'i
-        final stRaw = (t.state ?? '').trim();
-        if (stRaw.isNotEmpty) {
-          final up = stRaw.toUpperCase();
+        final stRaw = (t.state ?? '').trim().toUpperCase();
 
-          // Pickup modu tespiti
-          if ((up.contains('DELIVERY_OPEN') || up.contains('WAIT_PICKUP'))
+        // Arduino hâlâ event gönderiyor → hard timeout'u sıfırla
+        if (stRaw.isNotEmpty) _resetHardTimeout();
+
+        if (stRaw.isNotEmpty) {
+          // ── DELIVERY_OPEN → Pickup modu ──────────────────────────────────
+          if ((stRaw.contains('DELIVERY_OPEN') || stRaw.contains('WAIT_PICKUP'))
               && !_pickupMode) {
             _fallbackTimer?.cancel();
             _hardTimeout?.cancel();
             _animateTo(1.0);
+            _pulseCtrl.stop();
+            _celebCtrl.repeat(reverse: true); // kutlama başlat
             setState(() => _pickupMode = true);
             return;
           }
-
-          if (up != _mcuState) setState(() => _mcuState = up);
+          if (stRaw != _mcuState) setState(() => _mcuState = stRaw);
         }
 
-        // ── Arduino progress → her zaman öncelikli ─────────────────────────
+        // Arduino progress
         final p = t.progress;
         if (p != null) {
           final v = p.clamp(0.0, 1.0);
           if (v > _arduinoProgress) {
             _arduinoProgress = v;
-            // İlk Arduino verisi geldi → rozeti güncelle
             if (!_arduinoSynced) setState(() => _arduinoSynced = true);
-            _animateTo(v); // fallback'in önündeyse geçersiz kılar
+            _animateTo(v);
           }
         }
       });
@@ -250,7 +253,7 @@ class _PreparingPageState extends State<PreparingPage>
     }
   }
 
-  // ── Hata / timeout → SalesClosedPage ──────────────────────────────────────────
+  // ── Hata → SalesClosedPage ──────────────────────────────────────────────────
   void _goSalesClosed() {
     if (_finished) return;
     _finished = true;
@@ -264,7 +267,7 @@ class _PreparingPageState extends State<PreparingPage>
     );
   }
 
-  // ── ORDER_DONE → satış kaydet → HomePage ──────────────────────────────────────
+  // ── ORDER_DONE → satış kaydet → HomePage ────────────────────────────────────
   Future<void> _completeSale() async {
     if (_finished) return;
     _finished = true;
@@ -283,7 +286,6 @@ class _PreparingPageState extends State<PreparingPage>
     if (!mounted) return;
     await Future.delayed(const Duration(seconds: 2));
     if (!mounted) return;
-
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const HomePage()),
@@ -301,12 +303,13 @@ class _PreparingPageState extends State<PreparingPage>
   @override
   void dispose() {
     _cleanup();
-    _barCtrl.dispose();    // AnimationController mutlaka dispose edilmeli
-    _pulseCtrl.dispose();  // AnimationController mutlaka dispose edilmeli
+    _barCtrl.dispose();
+    _pulseCtrl.dispose();
+    _celebCtrl.dispose();
     super.dispose();
   }
 
-  // ═════════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
@@ -316,87 +319,258 @@ class _PreparingPageState extends State<PreparingPage>
     return BackgroundScaffold(
       extendBodyBehindAppBar: true,
       child: SafeArea(
-        child: Column(
-          children: [
-            SizedBox(height: h * 0.04),
-
-            // ── Ürün ikonu ───────────────────────────────────────────────────
-            ScaleTransition(
-              scale: _pickupMode
-                  ? const AlwaysStoppedAnimation(1.0)
-                  : _pulseAnim,
-              child: _ProductImage(height: h * 0.26),
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 500),
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeIn,
+          transitionBuilder: (child, anim) => FadeTransition(
+            opacity: anim,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.04),
+                end: Offset.zero,
+              ).animate(anim),
+              child: child,
             ),
-
-            SizedBox(height: h * 0.025),
-
-            // ── Durum yazısı ─────────────────────────────────────────────────
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 300),
-              transitionBuilder: (child, anim) => FadeTransition(
-                opacity: anim,
-                child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: const Offset(0, 0.12),
-                    end: Offset.zero,
-                  ).animate(anim),
-                  child: child,
-                ),
-              ),
-              child: Text(
-                _statusLabel,
-                key: ValueKey(_statusLabel),
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: (w * 0.052).clamp(24.0, 42.0),
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: -0.5,
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 6),
-
-            // ── İçecek ve boyut ──────────────────────────────────────────────
-            Text(
-              '$_drinkTitle  •  ${widget.volume}',
-              style: TextStyle(
-                color: Colors.white.withOpacity(0.65),
-                fontSize: (w * 0.026).clamp(15.0, 22.0),
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-
-            const Spacer(),
-
-            // ── İlerleme / Pickup bölgesi ────────────────────────────────────
-            Padding(
-              padding: EdgeInsets.symmetric(horizontal: w * 0.07),
-              child: AnimatedCrossFade(
-                duration: const Duration(milliseconds: 400),
-                crossFadeState: _pickupMode
-                    ? CrossFadeState.showSecond
-                    : CrossFadeState.showFirst,
-                firstChild: _ProgressSection(
-                  barCtrl: _barCtrl,
-                  arduinoSynced: _arduinoSynced,
-                ),
-                secondChild: const _PickupBanner(),
-              ),
-            ),
-
-            SizedBox(height: h * 0.07),
-          ],
+          ),
+          child: _pickupMode
+              ? _PickupScreen(
+            key: const ValueKey('pickup'),
+            headline: _headlineText,
+            subtitle: _subtitleText,
+            isLemon: _isLemon,
+            celebScale: _celebScale,
+            celebOpacity: _celebOpacity,
+            h: h,
+            w: w,
+          )
+              : _PreparingScreen(
+            key: const ValueKey('preparing'),
+            statusLabel: _preparingLabel,
+            drinkSubtitle: '$_drinkTitle  •  ${widget.volume}',
+            barCtrl: _barCtrl,
+            pulseAnim: _pulseAnim,
+            arduinoSynced: _arduinoSynced,
+            h: h,
+            w: w,
+          ),
         ),
       ),
     );
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Ürün görseli — asset yoksa ikon gösterir (crash yok)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// Hazırlık ekranı
+// ═════════════════════════════════════════════════════════════════════════════
+class _PreparingScreen extends StatelessWidget {
+  final String statusLabel;
+  final String drinkSubtitle;
+  final AnimationController barCtrl;
+  final Animation<double> pulseAnim;
+  final bool arduinoSynced;
+  final double h, w;
+
+  const _PreparingScreen({
+    super.key,
+    required this.statusLabel,
+    required this.drinkSubtitle,
+    required this.barCtrl,
+    required this.pulseAnim,
+    required this.arduinoSynced,
+    required this.h,
+    required this.w,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        SizedBox(height: h * 0.04),
+
+        // İkon
+        ScaleTransition(
+          scale: pulseAnim,
+          child: _ProductImage(height: h * 0.26),
+        ),
+
+        SizedBox(height: h * 0.028),
+
+        // Durum başlığı
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 300),
+          child: Text(
+            statusLabel,
+            key: ValueKey(statusLabel),
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: (w * 0.052).clamp(24.0, 42.0),
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.5,
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 6),
+
+        Text(
+          drinkSubtitle,
+          style: TextStyle(
+            color: Colors.white.withOpacity(0.65),
+            fontSize: (w * 0.026).clamp(15.0, 22.0),
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+
+        const Spacer(),
+
+        // Progress
+        Padding(
+          padding: EdgeInsets.symmetric(horizontal: w * 0.07),
+          child: _ProgressSection(
+            barCtrl: barCtrl,
+            arduinoSynced: arduinoSynced,
+          ),
+        ),
+
+        SizedBox(height: h * 0.07),
+      ],
+    );
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Pickup ekranı — "Buzlime Hazır!" / "İçeceğiniz Hazır!"
+// ═════════════════════════════════════════════════════════════════════════════
+class _PickupScreen extends StatelessWidget {
+  final String headline;
+  final String subtitle;
+  final bool isLemon;
+  final Animation<double> celebScale;
+  final Animation<double> celebOpacity;
+  final double h, w;
+
+  const _PickupScreen({
+    super.key,
+    required this.headline,
+    required this.subtitle,
+    required this.isLemon,
+    required this.celebScale,
+    required this.celebOpacity,
+    required this.h,
+    required this.w,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const Spacer(flex: 2),
+
+        // ── Animasyonlu ikon ──────────────────────────────────────────────────
+        AnimatedBuilder(
+          animation: celebScale,
+          builder: (_, child) => Transform.scale(
+            scale: celebScale.value,
+            child: Opacity(
+              opacity: celebOpacity.value,
+              child: child,
+            ),
+          ),
+          child: _ProductImage(height: h * 0.28),
+        ),
+
+        SizedBox(height: h * 0.04),
+
+        // ── Ana mesaj ─────────────────────────────────────────────────────────
+        Padding(
+          padding: EdgeInsets.symmetric(horizontal: w * 0.08),
+          child: Text(
+            headline,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: (w * 0.060).clamp(28.0, 52.0),
+              fontWeight: FontWeight.w900,
+              letterSpacing: -0.5,
+              height: 1.2,
+            ),
+          ),
+        ),
+
+        SizedBox(height: h * 0.022),
+
+        // ── Alt mesaj ─────────────────────────────────────────────────────────
+        Text(
+          subtitle,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.white.withOpacity(0.80),
+            fontSize: (w * 0.030).clamp(16.0, 26.0),
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+
+        SizedBox(height: h * 0.05),
+
+        // ── Ikon ve renk bandı ────────────────────────────────────────────────
+        _PickupBadge(isLemon: isLemon, w: w),
+
+        const Spacer(flex: 3),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pickup renkli rozet
+// ─────────────────────────────────────────────────────────────────────────────
+class _PickupBadge extends StatelessWidget {
+  final bool isLemon;
+  final double w;
+  const _PickupBadge({required this.isLemon, required this.w});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isLemon
+        ? const Color(0xFFD4E157)   // limon sarısı tonu
+        : const Color(0xFFFF8F00);  // portakal turuncusu
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 16),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.18),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: color.withOpacity(0.55), width: 2),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.shopping_bag_outlined,
+            color: color,
+            size: 28,
+          ),
+          const SizedBox(width: 12),
+          Text(
+            trEn('Bardağınızı alabilirsiniz', 'You may take your cup'),
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: (w * 0.026).clamp(14.0, 22.0),
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Ürün görseli — asset yoksa ikon fallback
+// ═════════════════════════════════════════════════════════════════════════════
 class _ProductImage extends StatelessWidget {
   final double height;
   const _ProductImage({required this.height});
@@ -407,7 +581,6 @@ class _ProductImage extends StatelessWidget {
       'assets/buttons_new/product.png',
       height: height,
       fit: BoxFit.contain,
-      // Asset yoksa kırmızı ekran yerine ikon göster
       errorBuilder: (_, __, ___) => Icon(
         Icons.local_drink_rounded,
         size: height * 0.6,
@@ -417,10 +590,9 @@ class _ProductImage extends StatelessWidget {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Progress bölgesi — ayrı widget, gereksiz rebuild'i önler
-// AnimationController dinlenir → setState gerekmiyor
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// Progress bölgesi
+// ═════════════════════════════════════════════════════════════════════════════
 class _ProgressSection extends StatelessWidget {
   final AnimationController barCtrl;
   final bool arduinoSynced;
@@ -434,14 +606,13 @@ class _ProgressSection extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: barCtrl,
-      builder: (context, _) {
+      builder: (_, __) {
         final val = barCtrl.value;
         final pct = (val * 100).toInt().clamp(0, 100);
 
         return Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Yüzde + Arduino rozeti
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -456,10 +627,7 @@ class _ProgressSection extends StatelessWidget {
                 _ArduinoBadge(synced: arduinoSynced),
               ],
             ),
-
             const SizedBox(height: 10),
-
-            // İlerleme çubuğu
             ClipRRect(
               borderRadius: BorderRadius.circular(14),
               child: LinearProgressIndicator(
@@ -467,17 +635,14 @@ class _ProgressSection extends StatelessWidget {
                 minHeight: 20,
                 valueColor: AlwaysStoppedAnimation<Color>(
                   arduinoSynced
-                      ? AppColors.bzPrimary       // Arduino aktif → teal
-                      : const Color(0xFF026B55),  // Fallback → koyu yeşil
+                      ? AppColors.bzPrimary
+                      : const Color(0xFF026B55),
                 ),
                 backgroundColor:
                 const Color(0xFF4EF2C0).withOpacity(0.30),
               ),
             ),
-
             const SizedBox(height: 16),
-
-            // Adım göstergesi
             _StepRow(progress: val),
           ],
         );
@@ -486,9 +651,9 @@ class _ProgressSection extends StatelessWidget {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 // Arduino senkron rozeti
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 class _ArduinoBadge extends StatelessWidget {
   final bool synced;
   const _ArduinoBadge({required this.synced});
@@ -532,44 +697,9 @@ class _ArduinoBadge extends StatelessWidget {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Pickup banner
-// ═══════════════════════════════════════════════════════════════════════════════
-class _PickupBanner extends StatelessWidget {
-  const _PickupBanner();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-      decoration: BoxDecoration(
-        color: AppColors.bzPrimary.withOpacity(0.18),
-        borderRadius: BorderRadius.circular(20),
-        border:
-        Border.all(color: AppColors.bzPrimary.withOpacity(0.55), width: 2),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.check_circle_rounded, color: Colors.white, size: 34),
-          const SizedBox(width: 14),
-          Text(
-            trEn('Teslim kapağı açık', 'Delivery door open'),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 22,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Adım göstergesi — progress değerini parametre olarak alır (setState yok)
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// Adım göstergesi
+// ─────────────────────────────────────────────────────────────────────────────
 class _StepRow extends StatelessWidget {
   final double progress;
   const _StepRow({required this.progress});
@@ -596,8 +726,7 @@ class _StepRow extends StatelessWidget {
               AnimatedContainer(
                 duration: const Duration(milliseconds: 350),
                 curve: Curves.easeOut,
-                width: 44,
-                height: 44,
+                width: 44, height: 44,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: done
@@ -614,11 +743,9 @@ class _StepRow extends StatelessWidget {
                     width: 2,
                   ),
                 ),
-                child: Icon(
-                  s.icon,
-                  color: done ? Colors.white : active ? Colors.white70 : Colors.white30,
-                  size: 20,
-                ),
+                child: Icon(s.icon,
+                    color: done ? Colors.white : active ? Colors.white70 : Colors.white30,
+                    size: 20),
               ),
               const SizedBox(height: 5),
               Text(
@@ -626,9 +753,7 @@ class _StepRow extends StatelessWidget {
                 style: TextStyle(
                   color: done
                       ? Colors.white
-                      : active
-                      ? Colors.white60
-                      : Colors.white.withOpacity(0.30),
+                      : active ? Colors.white60 : Colors.white.withOpacity(0.30),
                   fontSize: 12,
                   fontWeight: done ? FontWeight.bold : FontWeight.normal,
                 ),
