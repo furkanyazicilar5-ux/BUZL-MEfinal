@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import '../core/app_info.dart';
 import '../core/app_colors.dart';
 import '../core/i18n.dart';
-import 'payment_page.dart';
+import 'order_page.dart';
 import '../core/inactivity_watcher.dart';
 
 /// ProductPage — Revize Edildi
@@ -201,7 +201,7 @@ class _SizeCard extends StatelessWidget {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => PaymentPage(
+            builder: (_) => OrderPage(
               drinkCode: drinkCode,
               sizeMl: sizeMl,
               volume: volume,
